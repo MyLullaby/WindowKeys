@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Carbon
 import ServiceManagement
+import UniformTypeIdentifiers
 
 private enum WindowCommand: UInt32, CaseIterable {
     case resizeAndCenter = 1
@@ -78,6 +79,129 @@ private enum ResizePreferences {
 
     private static func clamp(_ value: Double) -> Double {
         min(max(value, minimumPercent), maximumPercent)
+    }
+}
+
+private struct InputSourceDescriptor {
+    let identifier: String
+    let localizedName: String
+}
+
+private enum InputMethodPreferences {
+    private static let defaultSourceKey = "defaultInputSourceID"
+    private static let appOverridesKey = "appInputSourceOverrides"
+
+    static var defaultSourceIdentifier: String? {
+        get { UserDefaults.standard.string(forKey: defaultSourceKey) }
+        set { UserDefaults.standard.set(newValue, forKey: defaultSourceKey) }
+    }
+
+    static var appOverrides: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: appOverridesKey) as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: appOverridesKey) }
+    }
+
+    static func sourceIdentifier(for bundleIdentifier: String) -> String? {
+        appOverrides[bundleIdentifier] ?? defaultSourceIdentifier
+    }
+
+    static func setOverride(_ sourceIdentifier: String, for bundleIdentifier: String) {
+        var overrides = appOverrides
+        overrides[bundleIdentifier] = sourceIdentifier
+        appOverrides = overrides
+    }
+
+    static func removeOverride(for bundleIdentifier: String) {
+        var overrides = appOverrides
+        overrides.removeValue(forKey: bundleIdentifier)
+        appOverrides = overrides
+    }
+}
+
+private enum InputSourceCatalog {
+    static func availableInputSources() -> [InputSourceDescriptor] {
+        let properties = [
+            kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource!,
+            kTISPropertyInputSourceIsSelectCapable as String: true
+        ] as CFDictionary
+        let sources = TISCreateInputSourceList(properties, false).takeRetainedValue() as NSArray
+        var descriptors: [InputSourceDescriptor] = []
+        var seenIdentifiers = Set<String>()
+
+        for case let source as TISInputSource in sources {
+            guard let identifier: String = property(source, key: kTISPropertyInputSourceID),
+                  let name: String = property(source, key: kTISPropertyLocalizedName),
+                  seenIdentifiers.insert(identifier).inserted else { continue }
+            descriptors.append(InputSourceDescriptor(identifier: identifier, localizedName: name))
+        }
+
+        return descriptors.sorted {
+            $0.localizedName.localizedCaseInsensitiveCompare($1.localizedName) == .orderedAscending
+        }
+    }
+
+    static func currentInputSourceIdentifier() -> String? {
+        let source = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+        return property(source, key: kTISPropertyInputSourceID)
+    }
+
+    @discardableResult
+    static func selectInputSource(identifier: String) -> Bool {
+        let properties = [kTISPropertyInputSourceID as String: identifier] as CFDictionary
+        let sources = TISCreateInputSourceList(properties, false).takeRetainedValue() as NSArray
+        guard let source = sources.firstObject as! TISInputSource? else { return false }
+        return TISSelectInputSource(source) == noErr
+    }
+
+    private static func property<T>(_ source: TISInputSource, key: CFString) -> T? {
+        guard let pointer = TISGetInputSourceProperty(source, key) else { return nil }
+        return Unmanaged<AnyObject>.fromOpaque(pointer).takeUnretainedValue() as? T
+    }
+}
+
+private final class InputMethodManager {
+    private var activationObserver: NSObjectProtocol?
+
+    init() {
+        if InputMethodPreferences.defaultSourceIdentifier == nil {
+            InputMethodPreferences.defaultSourceIdentifier = InputSourceCatalog.currentInputSourceIdentifier()
+                ?? InputSourceCatalog.availableInputSources().first?.identifier
+        }
+
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+                return
+            }
+            self?.applyInputSource(for: app)
+        }
+    }
+
+    deinit {
+        if let activationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
+        }
+    }
+
+    func applyToFrontmostApplication() {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return }
+        applyInputSource(for: app)
+    }
+
+    private func applyInputSource(for app: NSRunningApplication) {
+        guard app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              let bundleIdentifier = app.bundleIdentifier,
+              let targetIdentifier = InputMethodPreferences.sourceIdentifier(for: bundleIdentifier),
+              InputSourceCatalog.currentInputSourceIdentifier() != targetIdentifier else { return }
+
+        if InputSourceCatalog.selectInputSource(identifier: targetIdentifier) {
+            NSLog("WindowKeys: selected input source %@ for %@", targetIdentifier, bundleIdentifier)
+        } else {
+            NSLog("WindowKeys: input source %@ for %@ is unavailable", targetIdentifier, bundleIdentifier)
+        }
     }
 }
 
@@ -654,6 +778,322 @@ private final class ResizeSettingsWindowController: NSWindowController {
     }
 }
 
+private struct AppInputRule {
+    let bundleIdentifier: String
+    let sourceIdentifier: String
+}
+
+private final class RuleInputSourcePopUpButton: NSPopUpButton {
+    var appBundleIdentifier = ""
+}
+
+private final class InputMethodSettingsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+    private let defaultInputSourcePopUp = NSPopUpButton()
+    private let tableView = NSTableView()
+    private var inputSources: [InputSourceDescriptor] = []
+    private var rules: [AppInputRule] = []
+    var onConfigurationChange: (() -> Void)?
+
+    init() {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 500),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "应用输入法设置"
+        panel.isReleasedWhenClosed = false
+        panel.minSize = NSSize(width: 620, height: 420)
+        panel.collectionBehavior = [.moveToActiveSpace]
+        super.init(window: panel)
+        configureContent()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func showWindow(_ sender: Any?) {
+        reloadConfiguration()
+        super.showWindow(sender)
+        window?.center()
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func configureContent() {
+        guard let contentView = window?.contentView else { return }
+
+        let descriptionLabel = NSTextField(
+            wrappingLabelWithString: "切换应用时，WindowKeys 会优先使用应用的专属配置；没有专属配置时使用默认输入法。"
+        )
+        descriptionLabel.textColor = .secondaryLabelColor
+
+        let defaultLabel = NSTextField(labelWithString: "默认输入法：")
+        defaultLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        defaultInputSourcePopUp.target = self
+        defaultInputSourcePopUp.action = #selector(defaultInputSourceChanged(_:))
+        defaultInputSourcePopUp.widthAnchor.constraint(greaterThanOrEqualToConstant: 240).isActive = true
+
+        let defaultRow = NSStackView(views: [defaultLabel, defaultInputSourcePopUp, NSView()])
+        defaultRow.orientation = .horizontal
+        defaultRow.alignment = .centerY
+        defaultRow.spacing = 8
+
+        let rulesLabel = NSTextField(labelWithString: "应用专属配置")
+        rulesLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
+
+        let appColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("application"))
+        appColumn.title = "应用"
+        appColumn.minWidth = 260
+        appColumn.width = 330
+        let sourceColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("inputSource"))
+        sourceColumn.title = "输入法"
+        sourceColumn.minWidth = 190
+        sourceColumn.width = 260
+        let removeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("remove"))
+        removeColumn.title = ""
+        removeColumn.minWidth = 54
+        removeColumn.maxWidth = 54
+        removeColumn.width = 54
+        tableView.addTableColumn(appColumn)
+        tableView.addTableColumn(sourceColumn)
+        tableView.addTableColumn(removeColumn)
+        tableView.delegate = self
+        tableView.dataSource = self
+        tableView.rowHeight = 52
+        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.allowsColumnReordering = false
+        tableView.allowsColumnResizing = true
+        tableView.allowsEmptySelection = true
+
+        let scrollView = NSScrollView()
+        scrollView.documentView = tableView
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .bezelBorder
+
+        let addButton = NSButton(
+            title: "添加应用…",
+            target: self,
+            action: #selector(addApplication)
+        )
+        addButton.bezelStyle = .rounded
+
+        let hintLabel = NSTextField(labelWithString: "删除专属配置后，该应用会自动使用默认输入法。")
+        hintLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        hintLabel.textColor = .tertiaryLabelColor
+
+        let footer = NSStackView(views: [addButton, hintLabel, NSView()])
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.spacing = 12
+
+        let stack = NSStackView(views: [descriptionLabel, defaultRow, rulesLabel, scrollView, footer])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 22),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -22),
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 20),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -18),
+            descriptionLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            defaultRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            rulesLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            scrollView.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 240),
+            footer.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+    }
+
+    private func reloadConfiguration() {
+        inputSources = InputSourceCatalog.availableInputSources()
+        rules = InputMethodPreferences.appOverrides
+            .map { AppInputRule(bundleIdentifier: $0.key, sourceIdentifier: $0.value) }
+            .sorted { applicationName(for: $0.bundleIdentifier).localizedCaseInsensitiveCompare(
+                applicationName(for: $1.bundleIdentifier)
+            ) == .orderedAscending }
+
+        configure(defaultInputSourcePopUp, selectedIdentifier: InputMethodPreferences.defaultSourceIdentifier)
+        defaultInputSourcePopUp.isEnabled = !inputSources.isEmpty
+        tableView.reloadData()
+    }
+
+    private func configure(_ popUp: NSPopUpButton, selectedIdentifier: String?) {
+        popUp.removeAllItems()
+        for source in inputSources {
+            popUp.addItem(withTitle: source.localizedName)
+            popUp.lastItem?.representedObject = source.identifier
+        }
+
+        if let selectedIdentifier,
+           !inputSources.contains(where: { $0.identifier == selectedIdentifier }) {
+            popUp.addItem(withTitle: "不可用：\(selectedIdentifier)")
+            popUp.lastItem?.representedObject = selectedIdentifier
+        }
+
+        if let selectedIdentifier,
+           let selectedItem = popUp.itemArray.first(where: { $0.representedObject as? String == selectedIdentifier }) {
+            popUp.select(selectedItem)
+        } else if !popUp.itemArray.isEmpty {
+            popUp.selectItem(at: 0)
+        }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        rules.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let rule = rules[row]
+
+        switch tableColumn?.identifier.rawValue {
+        case "application":
+            return makeApplicationCell(bundleIdentifier: rule.bundleIdentifier)
+        case "inputSource":
+            let popUp = RuleInputSourcePopUpButton()
+            popUp.appBundleIdentifier = rule.bundleIdentifier
+            popUp.target = self
+            popUp.action = #selector(ruleInputSourceChanged(_:))
+            configure(popUp, selectedIdentifier: rule.sourceIdentifier)
+            return popUp
+        case "remove":
+            let button = NSButton(
+                title: "删除",
+                target: self,
+                action: #selector(removeRule(_:))
+            )
+            button.bezelStyle = .inline
+            button.identifier = NSUserInterfaceItemIdentifier(rule.bundleIdentifier)
+            return button
+        default:
+            return nil
+        }
+    }
+
+    private func makeApplicationCell(bundleIdentifier: String) -> NSView {
+        let cell = NSTableCellView()
+        let iconView = NSImageView()
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+
+        let nameLabel = NSTextField(labelWithString: applicationName(for: bundleIdentifier))
+        nameLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        nameLabel.lineBreakMode = .byTruncatingTail
+        let identifierLabel = NSTextField(labelWithString: bundleIdentifier)
+        identifierLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        identifierLabel.textColor = .secondaryLabelColor
+        identifierLabel.lineBreakMode = .byTruncatingMiddle
+
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
+            iconView.image = NSWorkspace.shared.icon(forFile: url.path)
+        } else {
+            iconView.image = NSImage(systemSymbolName: "app.dashed", accessibilityDescription: nil)
+        }
+
+        let labels = NSStackView(views: [nameLabel, identifierLabel])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 2
+        labels.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(iconView)
+        cell.addSubview(labels)
+
+        NSLayoutConstraint.activate([
+            iconView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            iconView.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 32),
+            iconView.heightAnchor.constraint(equalToConstant: 32),
+            labels.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            labels.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            labels.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+        ])
+        return cell
+    }
+
+    private func applicationName(for bundleIdentifier: String) -> String {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
+            return bundleIdentifier
+        }
+        return Bundle(url: url)?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+            ?? Bundle(url: url)?.object(forInfoDictionaryKey: "CFBundleName") as? String
+            ?? FileManager.default.displayName(atPath: url.path)
+    }
+
+    @objc private func defaultInputSourceChanged(_ sender: NSPopUpButton) {
+        guard let identifier = sender.selectedItem?.representedObject as? String else { return }
+        InputMethodPreferences.defaultSourceIdentifier = identifier
+        onConfigurationChange?()
+    }
+
+    @objc private func ruleInputSourceChanged(_ sender: RuleInputSourcePopUpButton) {
+        guard let identifier = sender.selectedItem?.representedObject as? String else { return }
+        InputMethodPreferences.setOverride(identifier, for: sender.appBundleIdentifier)
+        reloadConfiguration()
+        onConfigurationChange?()
+    }
+
+    @objc private func addApplication() {
+        guard let window else { return }
+        let panel = NSOpenPanel()
+        panel.title = "选择需要配置输入法的应用"
+        panel.prompt = "添加"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let self, let url = panel.url else { return }
+            guard let bundleIdentifier = Bundle(url: url)?.bundleIdentifier else {
+                self.showError(message: "无法读取所选应用的 Bundle ID。")
+                return
+            }
+            guard bundleIdentifier != Bundle.main.bundleIdentifier else {
+                self.showError(message: "WindowKeys 自身不会触发输入法切换，无需添加配置。")
+                return
+            }
+            let validDefaultIdentifier = InputMethodPreferences.defaultSourceIdentifier.flatMap { identifier in
+                self.inputSources.contains(where: { $0.identifier == identifier }) ? identifier : nil
+            }
+            guard let sourceIdentifier = validDefaultIdentifier
+                ?? InputSourceCatalog.currentInputSourceIdentifier()
+                ?? self.inputSources.first?.identifier else {
+                self.showError(message: "没有找到可用的输入法，请先在系统设置中启用输入法。")
+                return
+            }
+
+            InputMethodPreferences.setOverride(sourceIdentifier, for: bundleIdentifier)
+            self.reloadConfiguration()
+            self.onConfigurationChange?()
+        }
+    }
+
+    @objc private func removeRule(_ sender: NSButton) {
+        guard let bundleIdentifier = sender.identifier?.rawValue else { return }
+        InputMethodPreferences.removeOverride(for: bundleIdentifier)
+        reloadConfiguration()
+        onConfigurationChange?()
+    }
+
+    private func showError(message: String) {
+        let alert = NSAlert()
+        alert.messageText = "无法更新输入法配置"
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        if let window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
+}
+
 private final class GlobalHotKeyManager {
     private var globalMonitor: Any?
     private var localMonitor: Any?
@@ -703,11 +1143,13 @@ private final class GlobalHotKeyManager {
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotKeys: GlobalHotKeyManager?
+    private var inputMethodManager: InputMethodManager?
     private var statusItem: NSStatusItem!
     private var sizeSettingsItem: NSMenuItem!
     private var animationItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
     private var resizeSettingsWindowController: ResizeSettingsWindowController?
+    private var inputMethodSettingsWindowController: InputMethodSettingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         ResizePreferences.registerDefaults()
@@ -720,6 +1162,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             AccessibilityWindowController.shared.perform(command)
         }
         hotKeys = hotKeyManager
+
+        let inputManager = InputMethodManager()
+        inputMethodManager = inputManager
+        inputManager.applyToFrontmostApplication()
 
         UserDefaults.standard.set(AXIsProcessTrusted(), forKey: "AccessibilityTrustedAtLaunch")
 
@@ -765,6 +1211,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         animationItem.target = self
         animationItem.state = AccessibilityWindowController.shared.animationEnabled ? .on : .off
         menu.addItem(animationItem)
+
+        let inputMethodSettingsItem = NSMenuItem(
+            title: "应用输入法设置…",
+            action: #selector(showInputMethodSettings),
+            keyEquivalent: ""
+        )
+        inputMethodSettingsItem.target = self
+        menu.addItem(inputMethodSettingsItem)
 
         menu.addItem(.separator())
         launchAtLoginItem = NSMenuItem(
@@ -816,6 +1270,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let controller = AccessibilityWindowController.shared
         controller.animationEnabled.toggle()
         sender.state = controller.animationEnabled ? .on : .off
+    }
+
+    @objc private func showInputMethodSettings() {
+        let controller: InputMethodSettingsWindowController
+        if let inputMethodSettingsWindowController {
+            controller = inputMethodSettingsWindowController
+        } else {
+            controller = InputMethodSettingsWindowController()
+            controller.onConfigurationChange = { [weak self] in
+                self?.inputMethodManager?.applyToFrontmostApplication()
+            }
+            inputMethodSettingsWindowController = controller
+        }
+        controller.showWindow(nil)
     }
 
     @objc private func toggleLaunchAtLogin() {
