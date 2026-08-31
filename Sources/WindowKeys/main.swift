@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import ServiceManagement
 
 private enum WindowCommand: UInt32, CaseIterable {
     case resizeAndCenter = 1
@@ -700,11 +701,12 @@ private final class GlobalHotKeyManager {
     }
 }
 
-private final class AppDelegate: NSObject, NSApplicationDelegate {
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var hotKeys: GlobalHotKeyManager?
     private var statusItem: NSStatusItem!
     private var sizeSettingsItem: NSMenuItem!
     private var animationItem: NSMenuItem!
+    private var launchAtLoginItem: NSMenuItem!
     private var resizeSettingsWindowController: ResizeSettingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -733,6 +735,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "WindowKeys"
 
         let menu = NSMenu()
+        menu.delegate = self
         for command in WindowCommand.allCases {
             let item = NSMenuItem(
                 title: command.title,
@@ -764,10 +767,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(animationItem)
 
         menu.addItem(.separator())
+        launchAtLoginItem = NSMenuItem(
+            title: "开机自动启动",
+            action: #selector(toggleLaunchAtLogin),
+            keyEquivalent: ""
+        )
+        launchAtLoginItem.target = self
+        menu.addItem(launchAtLoginItem)
+        updateLaunchAtLoginItem()
+
+        menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "退出 WindowKeys", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
         statusItem.menu = menu
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        updateLaunchAtLoginItem()
     }
 
     @objc private func runMenuCommand(_ sender: NSMenuItem) {
@@ -799,6 +816,73 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = AccessibilityWindowController.shared
         controller.animationEnabled.toggle()
         sender.state = controller.animationEnabled ? .on : .off
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+
+        if service.status == .requiresApproval {
+            showLaunchAtLoginApprovalAlert()
+            return
+        }
+
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+            updateLaunchAtLoginItem()
+
+            if service.status == .requiresApproval {
+                showLaunchAtLoginApprovalAlert()
+            }
+        } catch {
+            updateLaunchAtLoginItem()
+            showLaunchAtLoginError(error)
+        }
+    }
+
+    private func updateLaunchAtLoginItem() {
+        guard launchAtLoginItem != nil else { return }
+
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            launchAtLoginItem.title = "开机自动启动"
+            launchAtLoginItem.state = .on
+        case .requiresApproval:
+            launchAtLoginItem.title = "开机自动启动（需要系统批准）"
+            launchAtLoginItem.state = .mixed
+        case .notRegistered, .notFound:
+            launchAtLoginItem.title = "开机自动启动"
+            launchAtLoginItem.state = .off
+        @unknown default:
+            launchAtLoginItem.title = "开机自动启动"
+            launchAtLoginItem.state = .off
+        }
+    }
+
+    private func showLaunchAtLoginApprovalAlert() {
+        let alert = NSAlert()
+        alert.messageText = "需要批准开机自动启动"
+        alert.informativeText = "请在“系统设置 → 通用 → 登录项与扩展”中允许 WindowKeys 在登录时打开。"
+        alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func showLaunchAtLoginError(_ error: Error) {
+        let alert = NSAlert()
+        alert.messageText = "无法修改开机自动启动"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "好")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc private func quit() {

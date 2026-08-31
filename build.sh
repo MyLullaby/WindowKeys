@@ -17,6 +17,7 @@ xcrun swiftc \
   -framework AppKit \
   -framework ApplicationServices \
   -framework Carbon \
+  -framework ServiceManagement \
   "$project_dir/Sources/WindowKeys/main.swift" \
   -o "$macos_dir/WindowKeys"
 
