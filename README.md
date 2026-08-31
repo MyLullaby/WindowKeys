@@ -1,5 +1,7 @@
 # WindowKeys
 
+[![Build](https://github.com/MyLullaby/WindowKeys/actions/workflows/build.yml/badge.svg)](https://github.com/MyLullaby/WindowKeys/actions/workflows/build.yml)
+
 一个只包含五个窗口动作的原生 macOS 菜单栏工具，编译目标为 Apple Silicon（arm64）。
 
 | 动作 | 全局快捷键 |
@@ -24,5 +26,10 @@
 ```sh
 ./build.sh
 ```
+
+每次向 GitHub 推送提交以及创建或更新 Pull Request 时，GitHub Actions 都会自动构建并校验
+Apple Silicon 版本。可以在仓库的 [Actions](https://github.com/MyLullaby/WindowKeys/actions/workflows/build.yml)
+页面打开对应的构建记录，并在页面底部的 **Artifacts** 中下载 `WindowKeys-macos-arm64-<提交哈希>`。
+也可以在 Actions 页面通过 **Run workflow** 手动触发构建。构建产物保留 30 天。
 
 首次启动后，在“系统设置 → 隐私与安全性 → 辅助功能”中允许 WindowKeys。

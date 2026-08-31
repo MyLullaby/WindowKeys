@@ -1,0 +1,44 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build macOS arm64 app
+    runs-on: macos-15
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build app
+        run: ./build.sh
+
+      - name: Verify app bundle
+        run: |
+          test -x build/WindowKeys.app/Contents/MacOS/WindowKeys
+          test "$(plutil -extract CFBundleIdentifier raw build/WindowKeys.app/Contents/Info.plist)" = "com.bland.windowkeys"
+          file build/WindowKeys.app/Contents/MacOS/WindowKeys | grep -q "arm64"
+          codesign --verify --deep --strict build/WindowKeys.app
+
+      - name: Package app
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/WindowKeys.app \
+            dist/WindowKeys-macos-arm64.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WindowKeys-macos-arm64-${{ github.sha }}
+          path: dist/WindowKeys-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
