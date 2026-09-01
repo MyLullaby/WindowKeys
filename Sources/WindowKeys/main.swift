@@ -87,6 +87,13 @@ private struct InputSourceDescriptor {
     let localizedName: String
 }
 
+private struct InputSourceTarget {
+    let source: TISInputSource
+    let sourceIdentifier: String
+    let inputModeIdentifier: String?
+    let requiresContextRefresh: Bool
+}
+
 private enum InputMethodPreferences {
     private static let defaultSourceKey = "defaultInputSourceID"
     private static let appOverridesKey = "appInputSourceOverrides"
@@ -145,12 +152,48 @@ private enum InputSourceCatalog {
         return property(source, key: kTISPropertyInputSourceID)
     }
 
-    @discardableResult
-    static func selectInputSource(identifier: String) -> Bool {
+    static func selectionTarget(identifier: String) -> InputSourceTarget? {
         let properties = [kTISPropertyInputSourceID as String: identifier] as CFDictionary
         let sources = TISCreateInputSourceList(properties, false).takeRetainedValue() as NSArray
-        guard let source = sources.firstObject as! TISInputSource? else { return false }
-        return TISSelectInputSource(source) == noErr
+        let matches = (sources as? [TISInputSource] ?? []).filter {
+            property($0, key: kTISPropertyInputSourceIsSelectCapable) as Bool? == true &&
+                property($0, key: kTISPropertyInputSourceIsEnabled) as Bool? == true
+        }
+        let source = matches.first {
+            let mode: String? = property($0, key: kTISPropertyInputModeID)
+            return mode == nil || mode?.isEmpty == true
+        } ?? matches.first
+        guard let source else { return nil }
+
+        let inputModeIdentifier: String? = property(source, key: kTISPropertyInputModeID)
+        let languages: [String] = property(source, key: kTISPropertyInputSourceLanguages) ?? []
+        return InputSourceTarget(
+            source: source,
+            sourceIdentifier: identifier,
+            inputModeIdentifier: inputModeIdentifier,
+            requiresContextRefresh: languages.first.map(needsTextInputContextRefresh) ?? false
+        )
+    }
+
+    static func currentInputSourceMatches(_ target: InputSourceTarget) -> Bool {
+        let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+        guard property(current, key: kTISPropertyInputSourceID) as String? == target.sourceIdentifier else {
+            return false
+        }
+
+        guard let targetModeIdentifier = target.inputModeIdentifier, !targetModeIdentifier.isEmpty else {
+            return true
+        }
+        return property(current, key: kTISPropertyInputModeID) as String? == targetModeIdentifier
+    }
+
+    @discardableResult
+    static func selectInputSource(_ target: InputSourceTarget) -> Bool {
+        TISSelectInputSource(target.source) == noErr
+    }
+
+    private static func needsTextInputContextRefresh(_ language: String) -> Bool {
+        language == "ko" || language == "ja" || language.hasPrefix("zh")
     }
 
     private static func property<T>(_ source: TISInputSource, key: CFString) -> T? {
@@ -161,6 +204,14 @@ private enum InputSourceCatalog {
 
 private final class InputMethodManager {
     private var activationObserver: NSObjectProtocol?
+    private var spaceChangeObserver: NSObjectProtocol?
+    private var verificationWorkItem: DispatchWorkItem?
+    private var spaceChangeWorkItem: DispatchWorkItem?
+    private var contextRefreshWorkItem: DispatchWorkItem?
+    private var contextRefreshPanel: InputContextRefreshPanel?
+    private var contextRefreshApplication: NSRunningApplication?
+    private var suppressedActivationPID: pid_t?
+    private var suppressedActivationDeadline: TimeInterval = 0
 
     init() {
         if InputMethodPreferences.defaultSourceIdentifier == nil {
@@ -178,12 +229,24 @@ private final class InputMethodManager {
             }
             self?.applyInputSource(for: app)
         }
+
+        spaceChangeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.scheduleSpaceChangeRefresh()
+        }
     }
 
     deinit {
         if let activationObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activationObserver)
         }
+        if let spaceChangeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(spaceChangeObserver)
+        }
+        cancelTransition()
     }
 
     func applyToFrontmostApplication() {
@@ -194,15 +257,160 @@ private final class InputMethodManager {
     private func applyInputSource(for app: NSRunningApplication) {
         guard app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
               let bundleIdentifier = app.bundleIdentifier,
-              let targetIdentifier = InputMethodPreferences.sourceIdentifier(for: bundleIdentifier),
-              InputSourceCatalog.currentInputSourceIdentifier() != targetIdentifier else { return }
+              !isSuppressedRestoredApplicationActivation(app),
+              let targetIdentifier = InputMethodPreferences.sourceIdentifier(for: bundleIdentifier) else { return }
 
-        if InputSourceCatalog.selectInputSource(identifier: targetIdentifier) {
-            NSLog("WindowKeys: selected input source %@ for %@", targetIdentifier, bundleIdentifier)
-        } else {
+        cancelTransition()
+
+        guard let target = InputSourceCatalog.selectionTarget(identifier: targetIdentifier) else {
             NSLog("WindowKeys: input source %@ for %@ is unavailable", targetIdentifier, bundleIdentifier)
+            return
+        }
+
+        if InputSourceCatalog.currentInputSourceMatches(target) {
+            if target.requiresContextRefresh {
+                refreshTextInputContext(target: target, for: app)
+            }
+            return
+        }
+
+        guard InputSourceCatalog.selectInputSource(target) else {
+            NSLog("WindowKeys: failed to select input source %@ for %@", targetIdentifier, bundleIdentifier)
+            return
+        }
+
+        NSLog("WindowKeys: selected input source %@ for %@", targetIdentifier, bundleIdentifier)
+        if target.requiresContextRefresh {
+            refreshTextInputContext(target: target, for: app)
+        } else {
+            scheduleVerification(of: target, for: app, remainingRetries: 2, after: 0.12)
         }
     }
+
+    private func refreshTextInputContext(target: InputSourceTarget, for app: NSRunningApplication) {
+        // Some input methods update the global menu-bar state before the target app's text
+        // input session is ready. Briefly focusing a real text responder synchronizes that session.
+        NSLog("WindowKeys: refreshing text input context for %@", app.bundleIdentifier ?? "unknown")
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            scheduleVerification(of: target, for: app, remainingRetries: 2, after: 0.12)
+            return
+        }
+
+        let panel = InputContextRefreshPanel(
+            contentRect: NSRect(
+                x: screen.frame.minX + 1,
+                y: screen.frame.minY + 1,
+                width: 1,
+                height: 1
+            ),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 1, height: 1))
+        panel.contentView = textView
+        panel.isReleasedWhenClosed = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.alphaValue = 0.001
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.level = .statusBar
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+
+        contextRefreshPanel = panel
+        contextRefreshApplication = app
+        suppressedActivationPID = app.processIdentifier
+        suppressedActivationDeadline = ProcessInfo.processInfo.systemUptime + 0.7
+
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeFirstResponder(textView)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.dismissContextRefreshPanel(restoreApplication: true)
+            self.scheduleVerification(of: target, for: app, remainingRetries: 1, after: 0.08)
+        }
+        contextRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+    }
+
+    private func scheduleVerification(
+        of target: InputSourceTarget,
+        for app: NSRunningApplication,
+        remainingRetries: Int,
+        after delay: TimeInterval
+    ) {
+        verificationWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  !app.isTerminated,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier,
+                  !InputSourceCatalog.currentInputSourceMatches(target) else { return }
+
+            if InputSourceCatalog.selectInputSource(target) {
+                NSLog("WindowKeys: retried input source %@ for %@", target.sourceIdentifier, app.bundleIdentifier ?? "unknown")
+            }
+            if remainingRetries > 1 {
+                self.scheduleVerification(
+                    of: target,
+                    for: app,
+                    remainingRetries: remainingRetries - 1,
+                    after: 0.15
+                )
+            }
+        }
+        verificationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func isSuppressedRestoredApplicationActivation(_ app: NSRunningApplication) -> Bool {
+        app.processIdentifier == suppressedActivationPID &&
+            ProcessInfo.processInfo.systemUptime < suppressedActivationDeadline
+    }
+
+    private func scheduleSpaceChangeRefresh() {
+        spaceChangeWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.applyToFrontmostApplication()
+        }
+        spaceChangeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: workItem)
+    }
+
+    private func cancelTransition() {
+        spaceChangeWorkItem?.cancel()
+        spaceChangeWorkItem = nil
+        verificationWorkItem?.cancel()
+        verificationWorkItem = nil
+        contextRefreshWorkItem?.cancel()
+        contextRefreshWorkItem = nil
+        dismissContextRefreshPanel(restoreApplication: false)
+        suppressedActivationPID = nil
+        suppressedActivationDeadline = 0
+    }
+
+    private func dismissContextRefreshPanel(restoreApplication: Bool) {
+        guard let panel = contextRefreshPanel else { return }
+        let application = contextRefreshApplication
+        contextRefreshPanel = nil
+        contextRefreshApplication = nil
+        panel.orderOut(nil)
+        panel.close()
+
+        guard restoreApplication,
+              let application,
+              !application.isTerminated,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier ==
+                ProcessInfo.processInfo.processIdentifier else { return }
+        application.activate(options: [])
+    }
+}
+
+private final class InputContextRefreshPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }
 
 private struct WindowFrame {
