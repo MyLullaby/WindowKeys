@@ -233,7 +233,7 @@ private final class InputMethodManager {
             self.switchInputSourceIfNeeded(for: app)
         }
         switchWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: workItem)
     }
 
     private func switchInputSourceIfNeeded(for app: NSRunningApplication) {
@@ -254,11 +254,17 @@ private final class InputMethodManager {
         controlDown.flags = .maskControl
         spaceDown.flags = .maskControl
         spaceUp.flags = .maskControl
-        controlDown.post(tap: .cghidEventTap)
-        spaceDown.post(tap: .cghidEventTap)
-        spaceUp.post(tap: .cghidEventTap)
-        controlUp.post(tap: .cghidEventTap)
-        NSLog("WindowKeys: sent Control-Space for %@ to switch to %@", bundleIdentifier, targetIdentifier)
+        controlUp.flags = []
+
+        let events = [controlDown, spaceDown, spaceUp, controlUp]
+        for (index, event) in events.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.02) {
+                event.post(tap: .cghidEventTap)
+                if index == events.count - 1 {
+                    NSLog("WindowKeys: sent Control-Space for %@ to switch to %@", bundleIdentifier, targetIdentifier)
+                }
+            }
+        }
     }
 }
 
