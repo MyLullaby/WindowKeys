@@ -279,6 +279,7 @@ private final class AccessibilityWindowController {
     static let shared = AccessibilityWindowController()
 
     private var animationTimer: Timer?
+    private var windowWorkItem: DispatchWorkItem?
     private var lastExternalPID: pid_t?
     private let animationDuration: TimeInterval = 0.16
 
@@ -313,6 +314,10 @@ private final class AccessibilityWindowController {
     }
 
     func perform(_ command: WindowCommand) {
+        animationTimer?.invalidate()
+        animationTimer = nil
+        windowWorkItem?.cancel()
+        windowWorkItem = nil
         guard AXIsProcessTrusted() else {
             showAccessibilityAlert()
             return
@@ -320,11 +325,6 @@ private final class AccessibilityWindowController {
 
         guard let application = focusedExternalApplication() else {
             NSSound.beep()
-            return
-        }
-
-        if let identifier = command.nativeMenuIdentifier,
-           performNativeWindowCommand(identifier: identifier, on: application) {
             return
         }
 
@@ -396,6 +396,24 @@ private final class AccessibilityWindowController {
             changesSize = true
         }
 
+        if let identifier = command.nativeMenuIdentifier,
+           performNativeWindowCommand(identifier: identifier, on: application) {
+            // AXPress reports that the menu action was accepted, not that the window moved.
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self, self.isFocused(window),
+                      let actual = self.readFrame(of: window),
+                      self.framesMatch(actual, current),
+                      !self.framesMatch(actual, target, tolerance: 16),
+                      self.isSettable(kAXSizeAttribute as CFString, on: window),
+                      self.isSettable(kAXPositionAttribute as CFString, on: window) else { return }
+                NSLog("WindowKeys: native command %@ left the frame unchanged; using fallback", identifier)
+                self.move(window, from: actual, to: target, changesSize: changesSize)
+            }
+            windowWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+            return
+        }
+
         guard !changesSize || isSettable(kAXSizeAttribute as CFString, on: window) else {
             NSSound.beep()
             return
@@ -459,17 +477,14 @@ private final class AccessibilityWindowController {
         }
 
         let menuBar = menuBarValue as! AXUIElement
-        var item = findElement(identifier: identifier, under: menuBar, depth: 0)
-        if item == nil {
-            revealNativeWindowMenus(under: menuBar)
-            item = findElement(identifier: identifier, under: menuBar, depth: 0)
-        }
-
-        guard let item else {
+        guard let item = findElement(identifier: identifier, under: menuBar, depth: 0) else {
             NSLog("WindowKeys: native command %@ was not found; using fallback", identifier)
             return false
         }
 
+        var enabled: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(item, kAXEnabledAttribute as CFString, &enabled) == .success,
+              enabled as? Bool == true else { return false }
         let result = AXUIElementPerformAction(item, kAXPressAction as CFString)
         if result == .success {
             NSLog("WindowKeys: performed native command %@", identifier)
@@ -478,26 +493,6 @@ private final class AccessibilityWindowController {
 
         NSLog("WindowKeys: native command %@ failed with AX error %d; using fallback", identifier, result.rawValue)
         return false
-    }
-
-    private func revealNativeWindowMenus(under menuBar: AXUIElement) {
-        guard let windowMenu = findElement(
-            titles: ["窗口", "Window"],
-            under: menuBar,
-            depth: 0
-        ) else { return }
-
-        AXUIElementPerformAction(windowMenu, kAXPressAction as CFString)
-        Thread.sleep(forTimeInterval: 0.04)
-
-        if let moveAndResize = findElement(
-            titles: ["移动与调整大小", "Move & Resize"],
-            under: windowMenu,
-            depth: 0
-        ) {
-            AXUIElementPerformAction(moveAndResize, kAXShowMenuAction as CFString)
-            Thread.sleep(forTimeInterval: 0.04)
-        }
     }
 
     private func findElement(identifier: String, under element: AXUIElement, depth: Int) -> AXUIElement? {
@@ -524,36 +519,6 @@ private final class AccessibilityWindowController {
 
         for child in children {
             if let match = findElement(identifier: identifier, under: child, depth: depth + 1) {
-                return match
-            }
-        }
-        return nil
-    }
-
-    private func findElement(titles: Set<String>, under element: AXUIElement, depth: Int) -> AXUIElement? {
-        guard depth <= 8 else { return nil }
-
-        var titleValue: CFTypeRef?
-        if AXUIElementCopyAttributeValue(
-            element,
-            kAXTitleAttribute as CFString,
-            &titleValue
-        ) == .success,
-        let title = titleValue as? String,
-        titles.contains(title) {
-            return element
-        }
-
-        var childrenValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXChildrenAttribute as CFString,
-            &childrenValue
-        ) == .success,
-        let children = childrenValue as? [AXUIElement] else { return nil }
-
-        for child in children {
-            if let match = findElement(titles: titles, under: child, depth: depth + 1) {
                 return match
             }
         }
@@ -629,6 +594,7 @@ private final class AccessibilityWindowController {
 
         guard animationEnabled else {
             apply(target, to: window, changesSize: changesSize)
+            settleFrame(of: window, target: target, changesSize: changesSize)
             return
         }
 
@@ -636,6 +602,11 @@ private final class AccessibilityWindowController {
         animationTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
             guard let self else {
                 timer.invalidate()
+                return
+            }
+            guard self.isFocused(window) else {
+                timer.invalidate()
+                self.animationTimer = nil
                 return
             }
 
@@ -657,8 +628,52 @@ private final class AccessibilityWindowController {
             if progress >= 1 {
                 timer.invalidate()
                 self.animationTimer = nil
+                self.settleFrame(of: window, target: target, changesSize: changesSize)
             }
         }
+    }
+
+    private func isFocused(_ window: AXUIElement) -> Bool {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(window, &pid) == .success,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+              let focused = focusedWindow(in: AXUIElementCreateApplication(pid)) else { return false }
+        return CFEqual(focused, window)
+    }
+
+    private func framesMatch(_ lhs: WindowFrame, _ rhs: WindowFrame, tolerance: CGFloat = 1) -> Bool {
+        abs(lhs.origin.x - rhs.origin.x) <= tolerance && abs(lhs.origin.y - rhs.origin.y) <= tolerance &&
+            abs(lhs.size.width - rhs.size.width) <= tolerance && abs(lhs.size.height - rhs.size.height) <= tolerance
+    }
+
+    private func settleFrame(of window: AXUIElement, target: WindowFrame, changesSize: Bool, attempts: Int = 4) {
+        // Leaving a system tile may restore an old frame after AX reports success. Read back
+        // and alternate position/size so a resize clamped by the old origin can recover too.
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.isFocused(window), let actual = self.readFrame(of: window) else { return }
+            let desired = changesSize ? target : WindowFrame(
+                origin: CGPoint(x: target.rect.midX - actual.size.width / 2, y: target.rect.midY - actual.size.height / 2),
+                size: actual.size
+            )
+            guard !self.framesMatch(actual, desired) else { return }
+            guard attempts > 0 else {
+                NSLog("WindowKeys: window did not reach the requested frame after settling")
+                return
+            }
+            let positionMatches = abs(actual.origin.x - desired.origin.x) <= 1 && abs(actual.origin.y - desired.origin.y) <= 1
+            let sizeMatches = abs(actual.size.width - desired.size.width) <= 1 && abs(actual.size.height - desired.size.height) <= 1
+            if changesSize && !sizeMatches && (positionMatches || attempts % 2 == 1) {
+                var size = desired.size
+                if let value = AXValueCreate(.cgSize, &size) {
+                    AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value)
+                }
+            } else {
+                self.apply(desired, to: window, changesSize: false)
+            }
+            self.settleFrame(of: window, target: target, changesSize: changesSize, attempts: attempts - 1)
+        }
+        windowWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
     }
 
     private func apply(_ frame: WindowFrame, to window: AXUIElement, changesSize: Bool) {
