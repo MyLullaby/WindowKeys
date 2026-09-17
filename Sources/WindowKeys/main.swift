@@ -43,7 +43,8 @@ private enum WindowCommand: UInt32, CaseIterable {
 
     var nativeMenuIdentifier: String? {
         switch self {
-        case .resizeAndCenter, .center: return nil
+        case .resizeAndCenter: return nil
+        case .center: return "_zoomCenter:"
         case .maximize: return "_zoomFill:"
         case .leftHalf: return "_zoomLeft:"
         case .rightHalf: return "_zoomRight:"
@@ -273,6 +274,16 @@ private struct WindowFrame {
     var size: CGSize
 
     var rect: CGRect { CGRect(origin: origin, size: size) }
+
+    func usingActualSize(_ actualSize: CGSize, within bounds: CGRect) -> WindowFrame {
+        WindowFrame(
+            origin: CGPoint(
+                x: min(max(rect.midX - actualSize.width / 2, bounds.minX), max(bounds.minX, bounds.maxX - actualSize.width)).rounded(),
+                y: min(max(rect.midY - actualSize.height / 2, bounds.minY), max(bounds.minY, bounds.maxY - actualSize.height)).rounded()
+            ),
+            size: actualSize
+        )
+    }
 }
 
 private final class AccessibilityWindowController {
@@ -281,7 +292,7 @@ private final class AccessibilityWindowController {
     private var animationTimer: Timer?
     private var windowWorkItem: DispatchWorkItem?
     private var lastExternalPID: pid_t?
-    private let animationDuration: TimeInterval = 0.16
+    private let animationDuration: TimeInterval = 0.3
 
     var animationEnabled: Bool {
         get {
@@ -328,6 +339,15 @@ private final class AccessibilityWindowController {
             return
         }
 
+        // System actions own their geometry, animation and tiling state completely.
+        // Never follow them with our own resize, even if AXPress has no visible effect.
+        if let identifier = command.nativeMenuIdentifier {
+            if !performNativeWindowCommand(identifier: identifier, on: application) {
+                NSSound.beep()
+            }
+            return
+        }
+
         guard let window = focusedWindow(in: application), let current = readFrame(of: window) else {
             NSSound.beep()
             return
@@ -338,83 +358,16 @@ private final class AccessibilityWindowController {
             return
         }
 
-        let target: WindowFrame
-        let changesSize: Bool
+        let size = CGSize(
+            width: (workArea.width * CGFloat(ResizePreferences.widthPercent / 100)).rounded(),
+            height: (workArea.height * CGFloat(ResizePreferences.heightPercent / 100)).rounded()
+        )
+        let target = WindowFrame(
+            origin: CGPoint(x: workArea.midX - size.width / 2, y: workArea.midY - size.height / 2),
+            size: size
+        )
 
-        switch command {
-        case .center:
-            // Intentionally preserve the exact current size and only write AXPosition.
-            // This avoids the redundant AXSize write that triggered the Loop diagnosis.
-            target = WindowFrame(
-                origin: CGPoint(
-                    x: workArea.midX - current.size.width / 2,
-                    y: workArea.midY - current.size.height / 2
-                ),
-                size: current.size
-            )
-            changesSize = false
-
-        case .resizeAndCenter:
-            let widthRatio = CGFloat(ResizePreferences.widthPercent / 100)
-            let heightRatio = CGFloat(ResizePreferences.heightPercent / 100)
-            let size = CGSize(
-                width: workArea.width * widthRatio,
-                height: workArea.height * heightRatio
-            )
-            target = WindowFrame(
-                origin: CGPoint(x: workArea.midX - size.width / 2, y: workArea.midY - size.height / 2),
-                size: size
-            )
-            changesSize = true
-
-        case .maximize:
-            let area = fallbackTiledArea(workArea)
-            target = WindowFrame(origin: area.origin, size: area.size)
-            changesSize = true
-
-        case .leftHalf:
-            let gap: CGFloat = 8
-            target = WindowFrame(
-                origin: CGPoint(x: workArea.minX + gap, y: workArea.minY + gap),
-                size: CGSize(
-                    width: floor(workArea.width / 2) - gap * 1.5,
-                    height: workArea.height - gap * 2
-                )
-            )
-            changesSize = true
-
-        case .rightHalf:
-            let gap: CGFloat = 8
-            let halfWidth = floor(workArea.width / 2)
-            target = WindowFrame(
-                origin: CGPoint(x: workArea.minX + halfWidth + gap / 2, y: workArea.minY + gap),
-                size: CGSize(
-                    width: workArea.width - halfWidth - gap * 1.5,
-                    height: workArea.height - gap * 2
-                )
-            )
-            changesSize = true
-        }
-
-        if let identifier = command.nativeMenuIdentifier,
-           performNativeWindowCommand(identifier: identifier, on: application) {
-            // AXPress reports that the menu action was accepted, not that the window moved.
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self, self.isFocused(window),
-                      let actual = self.readFrame(of: window),
-                      self.framesMatch(actual, current),
-                      !self.framesMatch(actual, target, tolerance: 16),
-                      self.isSettable(kAXSizeAttribute as CFString, on: window),
-                      self.isSettable(kAXPositionAttribute as CFString, on: window) else { return }
-                NSLog("WindowKeys: native command %@ left the frame unchanged; using fallback", identifier)
-                self.move(window, from: actual, to: target, changesSize: changesSize)
-            }
-            windowWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
-            return
-        }
-
-        guard !changesSize || isSettable(kAXSizeAttribute as CFString, on: window) else {
+        guard isSettable(kAXSizeAttribute as CFString, on: window) else {
             NSSound.beep()
             return
         }
@@ -423,7 +376,7 @@ private final class AccessibilityWindowController {
             return
         }
 
-        move(window, from: current, to: target, changesSize: changesSize)
+        move(window, from: current, to: target, within: workArea)
     }
 
     private func focusedExternalApplication() -> AXUIElement? {
@@ -472,26 +425,29 @@ private final class AccessibilityWindowController {
             &menuBarValue
         ) == .success,
         let menuBarValue else {
-            NSLog("WindowKeys: native command %@ has no accessible menu bar; using fallback", identifier)
+            NSLog("WindowKeys: native command %@ has no accessible menu bar", identifier)
             return false
         }
 
         let menuBar = menuBarValue as! AXUIElement
         guard let item = findElement(identifier: identifier, under: menuBar, depth: 0) else {
-            NSLog("WindowKeys: native command %@ was not found; using fallback", identifier)
+            NSLog("WindowKeys: native command %@ was not found", identifier)
             return false
         }
 
         var enabled: CFTypeRef?
         guard AXUIElementCopyAttributeValue(item, kAXEnabledAttribute as CFString, &enabled) == .success,
-              enabled as? Bool == true else { return false }
+              enabled as? Bool == true else {
+            NSLog("WindowKeys: native command %@ is unavailable", identifier)
+            return false
+        }
         let result = AXUIElementPerformAction(item, kAXPressAction as CFString)
         if result == .success {
             NSLog("WindowKeys: performed native command %@", identifier)
             return true
         }
 
-        NSLog("WindowKeys: native command %@ failed with AX error %d; using fallback", identifier, result.rawValue)
+        NSLog("WindowKeys: native command %@ failed with AX error %d", identifier, result.rawValue)
         return false
     }
 
@@ -575,10 +531,6 @@ private final class AccessibilityWindowController {
         return intersection.isNull ? 0 : intersection.width * intersection.height
     }
 
-    private func fallbackTiledArea(_ workArea: CGRect) -> CGRect {
-        workArea.insetBy(dx: 8, dy: 8)
-    }
-
     private func isSettable(_ attribute: CFString, on window: AXUIElement) -> Bool {
         var settable = DarwinBoolean(false)
         return AXUIElementIsAttributeSettable(window, attribute, &settable) == .success && settable.boolValue
@@ -588,22 +540,21 @@ private final class AccessibilityWindowController {
         _ window: AXUIElement,
         from start: WindowFrame,
         to target: WindowFrame,
-        changesSize: Bool
+        within bounds: CGRect
     ) {
         animationTimer?.invalidate()
         animationTimer = nil
         guard !framesMatch(start, target) else { return }
 
-        // Separate AX size/position writes cannot animate another app atomically.
-        // Apply resizes directly; keep the custom animation for position-only moves.
-        guard animationEnabled && !changesSize else {
-            apply(target, to: window, changesSize: changesSize)
-            settleFrame(of: window, target: target, changesSize: changesSize)
+        guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            apply(target, to: window, within: bounds)
+            settleFrame(of: window, target: target, within: bounds)
             return
         }
 
         let startTime = ProcessInfo.processInfo.systemUptime
-        animationTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+        let frameRate = max(60, NSScreen.main?.maximumFramesPerSecond ?? 60)
+        let timer = Timer(timeInterval: 1.0 / Double(frameRate), repeats: true) { [weak self] timer in
             guard let self else {
                 timer.invalidate()
                 return
@@ -619,22 +570,25 @@ private final class AccessibilityWindowController {
             let eased = 1 - pow(1 - progress, 3)
             let frame = WindowFrame(
                 origin: CGPoint(
-                    x: start.origin.x + (target.origin.x - start.origin.x) * eased,
-                    y: start.origin.y + (target.origin.y - start.origin.y) * eased
+                    x: (start.origin.x + (target.origin.x - start.origin.x) * eased).rounded(),
+                    y: (start.origin.y + (target.origin.y - start.origin.y) * eased).rounded()
                 ),
                 size: CGSize(
-                    width: start.size.width + (target.size.width - start.size.width) * eased,
-                    height: start.size.height + (target.size.height - start.size.height) * eased
+                    width: (start.size.width + (target.size.width - start.size.width) * eased).rounded(),
+                    height: (start.size.height + (target.size.height - start.size.height) * eased).rounded()
                 )
             )
-            self.apply(frame, to: window, changesSize: changesSize)
+            self.apply(frame, to: window, within: bounds)
 
             if progress >= 1 {
                 timer.invalidate()
                 self.animationTimer = nil
-                self.settleFrame(of: window, target: target, changesSize: changesSize)
+                self.settleFrame(of: window, target: target, within: bounds)
             }
         }
+        animationTimer = timer
+        // Keep the animation advancing during menu tracking as well as normal events.
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func isFocused(_ window: AXUIElement) -> Bool {
@@ -650,47 +604,55 @@ private final class AccessibilityWindowController {
             abs(lhs.size.width - rhs.size.width) <= tolerance && abs(lhs.size.height - rhs.size.height) <= tolerance
     }
 
-    private func settleFrame(of window: AXUIElement, target: WindowFrame, changesSize: Bool, attempts: Int = 4) {
+    private func settleFrame(of window: AXUIElement, target: WindowFrame, within bounds: CGRect, attempts: Int = 4) {
         // Leaving a system tile may restore an old frame after AX reports success.
         // Correct position and size in one pass instead of separate delayed steps.
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.isFocused(window), let actual = self.readFrame(of: window) else { return }
-            let desired = changesSize ? target : WindowFrame(
-                origin: CGPoint(x: target.rect.midX - actual.size.width / 2, y: target.rect.midY - actual.size.height / 2),
-                size: actual.size
-            )
-            guard !self.framesMatch(actual, desired) else { return }
+            guard !self.framesMatch(actual, target) else { return }
             guard attempts > 0 else {
                 NSLog("WindowKeys: window did not reach the requested frame after settling")
                 return
             }
-            let positionMatches = abs(actual.origin.x - desired.origin.x) <= 1 && abs(actual.origin.y - desired.origin.y) <= 1
-            let sizeMatches = abs(actual.size.width - desired.size.width) <= 1 && abs(actual.size.height - desired.size.height) <= 1
-            if changesSize && !sizeMatches {
-                if !positionMatches {
-                    // Move away from the screen edge before retrying a clamped resize.
-                    self.apply(desired, to: window, changesSize: false)
-                }
-                // Reapply the origin after resizing: the app may have moved it again.
-                self.apply(desired, to: window, changesSize: true)
-            } else if !positionMatches {
-                self.apply(desired, to: window, changesSize: false)
-            }
-            self.settleFrame(of: window, target: target, changesSize: changesSize, attempts: attempts - 1)
+            self.apply(target, to: window, within: bounds)
+            self.settleFrame(of: window, target: target, within: bounds, attempts: attempts - 1)
         }
         windowWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
     }
 
-    private func apply(_ frame: WindowFrame, to window: AXUIElement, changesSize: Bool) {
-        if changesSize {
-            var size = frame.size
+    private func apply(_ frame: WindowFrame, to window: AXUIElement, within bounds: CGRect) {
+        guard let before = readFrame(of: window) else { return }
+        let requested = frame.usingActualSize(frame.size, within: bounds)
+        let sizeChanged = abs(before.size.width - requested.size.width) > 1 ||
+            abs(before.size.height - requested.size.height) > 1
+        if sizeChanged {
+            // Make room before growing, but shrink before moving. Doing this per frame
+            // avoids asking macOS to grow a window beyond the current screen edge.
+            var preResizeOrigin = before.origin
+            if requested.size.width > before.size.width + 1 {
+                preResizeOrigin.x = min(before.origin.x, max(bounds.minX, bounds.maxX - requested.size.width))
+            }
+            if requested.size.height > before.size.height + 1 {
+                preResizeOrigin.y = min(before.origin.y, max(bounds.minY, bounds.maxY - requested.size.height))
+            }
+            setPosition(preResizeOrigin, on: window, from: before.origin)
+            var size = requested.size
             if let value = AXValueCreate(.cgSize, &size) {
                 AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value)
             }
         }
 
-        var origin = frame.origin
+        // A window may impose a minimum size or macOS may restore its pre-tile frame.
+        // Anchor this frame's *actual* size on the moving center, not the requested size.
+        guard let actual = readFrame(of: window) else { return }
+        let positioned = requested.usingActualSize(actual.size, within: bounds)
+        setPosition(positioned.origin, on: window, from: actual.origin)
+    }
+
+    private func setPosition(_ position: CGPoint, on window: AXUIElement, from current: CGPoint) {
+        guard abs(position.x - current.x) > 1 || abs(position.y - current.y) > 1 else { return }
+        var origin = position
         if let value = AXValueCreate(.cgPoint, &origin) {
             AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
         }
@@ -1288,7 +1250,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(sizeSettingsItem)
 
         animationItem = NSMenuItem(
-            title: "自定义窗口动画",
+            title: "调整大小并居中动画",
             action: #selector(toggleAnimation(_:)),
             keyEquivalent: ""
         )

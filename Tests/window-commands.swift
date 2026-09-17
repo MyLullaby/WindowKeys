@@ -18,6 +18,20 @@ func wait(_ seconds: Double) {
 }
 
 func runChecks() -> Int32 {
+    assert(WindowCommand.resizeAndCenter.nativeMenuIdentifier == nil)
+    assert(WindowCommand.center.nativeMenuIdentifier == "_zoomCenter:")
+    assert(WindowCommand.maximize.nativeMenuIdentifier == "_zoomFill:")
+    assert(WindowCommand.leftHalf.nativeMenuIdentifier == "_zoomLeft:")
+    assert(WindowCommand.rightHalf.nativeMenuIdentifier == "_zoomRight:")
+    let bounds = CGRect(x: -1440, y: 40, width: 1440, height: 900)
+    let requested = WindowFrame(origin: CGPoint(x: -1020, y: 240), size: CGSize(width: 600, height: 400))
+    let constrained = requested.usingActualSize(CGSize(width: 800, height: 500), within: bounds)
+    assert(constrained.origin == CGPoint(x: -1120, y: 190))
+    let oversized = requested.usingActualSize(CGSize(width: 1800, height: 1100), within: bounds)
+    assert(oversized.origin == bounds.origin)
+    print("PASS native command mapping and actual-size anchoring")
+    if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--geometry-only" { return 0 }
+
     guard CommandLine.arguments.count == 3, AXIsProcessTrusted() else {
         print("Usage: run-window-commands.sh <bundle-id> <window-title>; Accessibility permission required")
         return 2
@@ -64,6 +78,10 @@ func runChecks() -> Int32 {
     let originalAnimationEnabled = controller.animationEnabled
     controller.animationEnabled = true
     defer { controller.animationEnabled = originalAnimationEnabled }
+    let windowManager = UserDefaults(suiteName: "com.apple.WindowManager")
+    let paddingEnabled = windowManager?.object(forKey: "EnableTiledWindowMargins") as? Bool ?? true
+    let padding = paddingEnabled ? CGFloat((windowManager?.object(forKey: "TiledWindowSpacing") as? NSNumber)?.doubleValue ?? 8) : 0
+    let filled = area.insetBy(dx: padding, dy: padding)
     func perform(_ command: WindowCommand) -> Bool {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetApp.processIdentifier,
               let focused = attribute(appElement, "AXFocusedWindow"), CFEqual(focused, window) else {
@@ -90,14 +108,29 @@ func runChecks() -> Int32 {
     wait(0.3)
     let size = CGSize(width: area.width * ResizePreferences.widthPercent / 100, height: area.height * ResizePreferences.heightPercent / 100)
     let centered = CGRect(x: area.midX - size.width / 2, y: area.midY - size.height / 2, width: size.width, height: size.height)
+    let beforeResize = frame(window)
     guard perform(.resizeAndCenter) else { return 3 }
-    // No run-loop wait: an ordinary resize must not depend on animation timer ticks.
-    check("resize applies directly with animation enabled", centered)
+    if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        // No timer tick yet: catches accidental removal of the resize animation.
+        check("animated resize starts at the original frame", beforeResize)
+        wait(0.08)
+        let intermediate = frame(window)
+        let moved = abs(intermediate.minX - beforeResize.minX) > 2 || abs(intermediate.minY - beforeResize.minY) > 2 ||
+            abs(intermediate.width - beforeResize.width) > 2 || abs(intermediate.height - beforeResize.height) > 2
+        let finished = abs(intermediate.minX - centered.minX) <= 2 && abs(intermediate.minY - centered.minY) <= 2 &&
+            abs(intermediate.width - centered.width) <= 2 && abs(intermediate.height - centered.height) <= 2
+        if moved && !finished {
+            print("PASS resize has an intermediate animation frame")
+        } else {
+            print("FAIL resize did not expose an intermediate animation frame: \(intermediate)")
+            failures += 1
+        }
+    }
     wait(1)
-    check("direct resize remains centered", centered)
+    check("animated resize finishes centered", centered)
     guard perform(.maximize) else { return 3 }
     wait(1)
-    check("maximize", area.insetBy(dx: 8, dy: 8), tolerance: 16)
+    check("native maximize", filled, tolerance: 16)
     guard perform(.resizeAndCenter) else { return 3 }
     wait(1)
     check("resize after native tiling", centered)
@@ -111,11 +144,11 @@ func runChecks() -> Int32 {
     check("center with one command", expectedCenter)
     AXUIElementSetAttributeValue(window, "AXPosition" as CFString, AXValueCreate(.cgPoint, &setupPosition)!)
     wait(0.3)
-    guard perform(.center) else { return 3 }
+    guard perform(.resizeAndCenter) else { return 3 }
     wait(0.04)
     guard perform(.maximize) else { return 3 }
     wait(1)
-    check("maximize interrupts old animation", area.insetBy(dx: 8, dy: 8), tolerance: 16)
+    check("native maximize cancels custom resize animation", filled, tolerance: 16)
     let enhancedAfter = attribute(appElement, "AXEnhancedUserInterface") as? Bool
     if enhancedBefore != enhancedAfter { print("FAIL enhanced accessibility state changed"); failures += 1 }
     return failures == 0 ? 0 : 1
