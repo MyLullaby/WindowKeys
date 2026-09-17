@@ -591,8 +591,12 @@ private final class AccessibilityWindowController {
         changesSize: Bool
     ) {
         animationTimer?.invalidate()
+        animationTimer = nil
+        guard !framesMatch(start, target) else { return }
 
-        guard animationEnabled else {
+        // Separate AX size/position writes cannot animate another app atomically.
+        // Apply resizes directly; keep the custom animation for position-only moves.
+        guard animationEnabled && !changesSize else {
             apply(target, to: window, changesSize: changesSize)
             settleFrame(of: window, target: target, changesSize: changesSize)
             return
@@ -647,8 +651,8 @@ private final class AccessibilityWindowController {
     }
 
     private func settleFrame(of window: AXUIElement, target: WindowFrame, changesSize: Bool, attempts: Int = 4) {
-        // Leaving a system tile may restore an old frame after AX reports success. Read back
-        // and alternate position/size so a resize clamped by the old origin can recover too.
+        // Leaving a system tile may restore an old frame after AX reports success.
+        // Correct position and size in one pass instead of separate delayed steps.
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.isFocused(window), let actual = self.readFrame(of: window) else { return }
             let desired = changesSize ? target : WindowFrame(
@@ -662,12 +666,14 @@ private final class AccessibilityWindowController {
             }
             let positionMatches = abs(actual.origin.x - desired.origin.x) <= 1 && abs(actual.origin.y - desired.origin.y) <= 1
             let sizeMatches = abs(actual.size.width - desired.size.width) <= 1 && abs(actual.size.height - desired.size.height) <= 1
-            if changesSize && !sizeMatches && (positionMatches || attempts % 2 == 1) {
-                var size = desired.size
-                if let value = AXValueCreate(.cgSize, &size) {
-                    AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value)
+            if changesSize && !sizeMatches {
+                if !positionMatches {
+                    // Move away from the screen edge before retrying a clamped resize.
+                    self.apply(desired, to: window, changesSize: false)
                 }
-            } else {
+                // Reapply the origin after resizing: the app may have moved it again.
+                self.apply(desired, to: window, changesSize: true)
+            } else if !positionMatches {
                 self.apply(desired, to: window, changesSize: false)
             }
             self.settleFrame(of: window, target: target, changesSize: changesSize, attempts: attempts - 1)

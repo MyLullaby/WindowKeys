@@ -61,6 +61,9 @@ func runChecks() -> Int32 {
         return (left.isNull ? 0 : left.width * left.height) < (right.isNull ? 0 : right.width * right.height)
     }) else { return 2 }
     let controller = AccessibilityWindowController.shared
+    let originalAnimationEnabled = controller.animationEnabled
+    controller.animationEnabled = true
+    defer { controller.animationEnabled = originalAnimationEnabled }
     func perform(_ command: WindowCommand) -> Bool {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == targetApp.processIdentifier,
               let focused = attribute(appElement, "AXFocusedWindow"), CFEqual(focused, window) else {
@@ -85,13 +88,18 @@ func runChecks() -> Int32 {
     wait(0.3)
     AXUIElementSetAttributeValue(window, "AXPosition" as CFString, AXValueCreate(.cgPoint, &setupPosition)!)
     wait(0.3)
+    let size = CGSize(width: area.width * ResizePreferences.widthPercent / 100, height: area.height * ResizePreferences.heightPercent / 100)
+    let centered = CGRect(x: area.midX - size.width / 2, y: area.midY - size.height / 2, width: size.width, height: size.height)
+    guard perform(.resizeAndCenter) else { return 3 }
+    // No run-loop wait: an ordinary resize must not depend on animation timer ticks.
+    check("resize applies directly with animation enabled", centered)
+    wait(1)
+    check("direct resize remains centered", centered)
     guard perform(.maximize) else { return 3 }
     wait(1)
     check("maximize", area.insetBy(dx: 8, dy: 8), tolerance: 16)
     guard perform(.resizeAndCenter) else { return 3 }
     wait(1)
-    let size = CGSize(width: area.width * ResizePreferences.widthPercent / 100, height: area.height * ResizePreferences.heightPercent / 100)
-    let centered = CGRect(x: area.midX - size.width / 2, y: area.midY - size.height / 2, width: size.width, height: size.height)
     check("resize after native tiling", centered)
     AXUIElementSetAttributeValue(window, "AXPosition" as CFString, AXValueCreate(.cgPoint, &setupPosition)!)
     wait(0.3)
