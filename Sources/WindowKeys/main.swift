@@ -278,21 +278,112 @@ private struct WindowFrame {
     func usingActualSize(_ actualSize: CGSize, within bounds: CGRect) -> WindowFrame {
         WindowFrame(
             origin: CGPoint(
-                x: min(max(rect.midX - actualSize.width / 2, bounds.minX), max(bounds.minX, bounds.maxX - actualSize.width)).rounded(),
-                y: min(max(rect.midY - actualSize.height / 2, bounds.minY), max(bounds.minY, bounds.maxY - actualSize.height)).rounded()
+                x: rect.midX - actualSize.width / 2,
+                y: rect.midY - actualSize.height / 2
             ),
             size: actualSize
-        )
+        ).clamped(to: bounds)
+    }
+
+    func clamped(to bounds: CGRect) -> WindowFrame {
+        WindowFrame(origin: CGPoint(
+            x: min(max(origin.x, bounds.minX), max(bounds.minX, bounds.maxX - size.width)).rounded(),
+            y: min(max(origin.y, bounds.minY), max(bounds.minY, bounds.maxY - size.height)).rounded()
+        ), size: size)
+    }
+
+    func animationPosition(actualSize: CGSize, within bounds: CGRect) -> CGPoint {
+        // A minimum size must not pull the moving center around on every frame.
+        // Only compensate mid-animation for a size constrained below the request.
+        if actualSize.width <= size.width + 2 && actualSize.height <= size.height + 2 &&
+            (abs(actualSize.width - size.width) > 2 || abs(actualSize.height - size.height) > 2) {
+            return usingActualSize(actualSize, within: bounds).origin
+        }
+        return WindowFrame(origin: origin, size: actualSize).clamped(to: bounds).origin
+    }
+}
+
+// Resize constraints are learned from accepted frames, not from AX setter return codes.
+// This is limited to centered resizing; native actions handle edge/corner anchoring.
+private struct ResizeConstraint {
+    var fixedWidth: CGFloat?
+    var fixedHeight: CGFloat?
+    var aspectRatio: CGFloat?
+
+    func sizeToRequest(_ requested: CGSize) -> CGSize {
+        CGSize(width: fixedWidth ?? requested.width, height: fixedHeight ?? requested.height)
+    }
+
+    func predictedSize(_ requested: CGSize) -> CGSize? {
+        guard let ratio = aspectRatio else { return nil }
+        let width = min(requested.width, requested.height * ratio)
+        return CGSize(width: width, height: width / ratio)
+    }
+
+    mutating func observe(previous: CGSize, requested: CGSize, actual: CGSize) {
+        guard actual.width <= requested.width + 2, actual.height <= requested.height + 2 else {
+            self = ResizeConstraint()
+            return
+        }
+        let requestedWidthChanged = abs(requested.width - previous.width) > 2
+        let requestedHeightChanged = abs(requested.height - previous.height) > 2
+        let actualWidthChanged = abs(actual.width - previous.width) > 2
+        let actualHeightChanged = abs(actual.height - previous.height) > 2
+        let differsFromRequest = abs(actual.width - requested.width) > 2 || abs(actual.height - requested.height) > 2
+        if previous.width > 0, previous.height > 0, actual.width > 0, actual.height > 0,
+           differsFromRequest,
+           (requestedWidthChanged && requestedHeightChanged || actualWidthChanged || actualHeightChanged),
+           abs(actual.width / actual.height - previous.width / previous.height) <= 0.01 {
+            aspectRatio = actual.width / actual.height
+            fixedWidth = nil
+            fixedHeight = nil
+        } else if fixedWidth == nil && fixedHeight == nil {
+            if requestedWidthChanged && !actualWidthChanged { fixedWidth = actual.width }
+            if requestedHeightChanged && !actualHeightChanged { fixedHeight = actual.height }
+            if fixedWidth != nil || fixedHeight != nil { aspectRatio = nil }
+        }
+    }
+}
+
+private final class WindowResizeAnimation: NSAnimation {
+    private let applyFrame: (CGFloat) -> Bool
+    private let completion: () -> Void
+    private var finished = false
+
+    init(applyFrame: @escaping (CGFloat) -> Bool, completion: @escaping () -> Void) {
+        self.applyFrame = applyFrame
+        self.completion = completion
+        super.init(duration: 0.3, animationCurve: .easeOut)
+        animationBlockingMode = .nonblocking
+        frameRate = Float(NSScreen.main?.maximumFramesPerSecond ?? 60)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func cancel() {
+        finished = true
+        super.stop()
+    }
+
+    override var currentProgress: NSAnimation.Progress {
+        didSet {
+            guard !finished else { return }
+            let eased = 1 - pow(1 - CGFloat(currentValue), 3)
+            guard applyFrame(eased) else { cancel(); return }
+            if currentProgress >= 1 {
+                finished = true
+                super.stop()
+                completion()
+            }
+        }
     }
 }
 
 private final class AccessibilityWindowController {
     static let shared = AccessibilityWindowController()
 
-    private var animationTimer: Timer?
-    private var windowWorkItem: DispatchWorkItem?
+    private var resizeAnimation: WindowResizeAnimation?
     private var lastExternalPID: pid_t?
-    private let animationDuration: TimeInterval = 0.3
 
     var animationEnabled: Bool {
         get {
@@ -325,10 +416,8 @@ private final class AccessibilityWindowController {
     }
 
     func perform(_ command: WindowCommand) {
-        animationTimer?.invalidate()
-        animationTimer = nil
-        windowWorkItem?.cancel()
-        windowWorkItem = nil
+        resizeAnimation?.cancel()
+        resizeAnimation = nil
         guard AXIsProcessTrusted() else {
             showAccessibilityAlert()
             return
@@ -376,7 +465,7 @@ private final class AccessibilityWindowController {
             return
         }
 
-        move(window, from: current, to: target, within: workArea)
+        move(window, in: application, from: current, to: target, within: workArea)
     }
 
     private func focusedExternalApplication() -> AXUIElement? {
@@ -538,36 +627,51 @@ private final class AccessibilityWindowController {
 
     private func move(
         _ window: AXUIElement,
+        in application: AXUIElement,
         from start: WindowFrame,
         to target: WindowFrame,
         within bounds: CGRect
     ) {
-        animationTimer?.invalidate()
-        animationTimer = nil
         guard !framesMatch(start, target) else { return }
 
-        guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            apply(target, to: window, within: bounds)
-            settleFrame(of: window, target: target, within: bounds)
+        var enhancedValue: CFTypeRef?
+        let enhancedAttribute = "AXEnhancedUserInterface" as CFString
+        AXUIElementCopyAttributeValue(application, enhancedAttribute, &enhancedValue)
+        let enhancedUI = enhancedValue as? Bool == true
+        guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && !enhancedUI else {
+            // Match Loop's compatibility path. Keep this synchronous and restore the
+            // original flag in defer on every exit, including failed AX writes.
+            if enhancedUI {
+                AXUIElementSetAttributeValue(application, enhancedAttribute, kCFBooleanFalse)
+            }
+            defer {
+                if enhancedUI {
+                    AXUIElementSetAttributeValue(application, enhancedAttribute, kCFBooleanTrue)
+                    var restored: CFTypeRef?
+                    AXUIElementCopyAttributeValue(application, enhancedAttribute, &restored)
+                    if restored as? Bool != true {
+                        NSLog("WindowKeys: could not restore enhanced accessibility state")
+                    }
+                }
+            }
+            // At most two immediate applications, never a delayed resize loop.
+            for _ in 0..<2 {
+                guard let actual = readFrame(of: window), !framesMatch(actual, target) else { break }
+                setPosition(target.origin, on: window, from: actual.origin)
+                setSize(target.size, on: window)
+            }
+            finishResize(of: window, target: target, within: bounds)
             return
         }
 
-        let startTime = ProcessInfo.processInfo.systemUptime
-        let frameRate = max(60, NSScreen.main?.maximumFramesPerSecond ?? 60)
-        let timer = Timer(timeInterval: 1.0 / Double(frameRate), repeats: true) { [weak self] timer in
-            guard let self else {
-                timer.invalidate()
-                return
-            }
+        var lastFrame = start
+        var constraint = ResizeConstraint()
+        let animation = WindowResizeAnimation(applyFrame: { [weak self] eased in
+            guard let self else { return false }
             guard self.isFocused(window) else {
-                timer.invalidate()
-                self.animationTimer = nil
-                return
+                self.resizeAnimation = nil
+                return false
             }
-
-            let elapsed = ProcessInfo.processInfo.systemUptime - startTime
-            let progress = min(1, elapsed / self.animationDuration)
-            let eased = 1 - pow(1 - progress, 3)
             let frame = WindowFrame(
                 origin: CGPoint(
                     x: (start.origin.x + (target.origin.x - start.origin.x) * eased).rounded(),
@@ -578,17 +682,21 @@ private final class AccessibilityWindowController {
                     height: (start.size.height + (target.size.height - start.size.height) * eased).rounded()
                 )
             )
-            self.apply(frame, to: window, within: bounds)
-
-            if progress >= 1 {
-                timer.invalidate()
-                self.animationTimer = nil
-                self.settleFrame(of: window, target: target, within: bounds)
+            guard let accepted = self.applyAnimationFrame(frame, to: window, previous: lastFrame,
+                                                          constraint: &constraint, within: bounds) else {
+                self.resizeAnimation = nil
+                return false
             }
-        }
-        animationTimer = timer
-        // Keep the animation advancing during menu tracking as well as normal events.
-        RunLoop.main.add(timer, forMode: .common)
+            lastFrame = accepted
+            return true
+        }, completion: { [weak self] in
+            guard let self else { return }
+            self.resizeAnimation = nil
+            guard self.isFocused(window) else { return }
+            self.finishResize(of: window, target: target, within: bounds)
+        })
+        resizeAnimation = animation
+        animation.start()
     }
 
     private func isFocused(_ window: AXUIElement) -> Bool {
@@ -604,50 +712,42 @@ private final class AccessibilityWindowController {
             abs(lhs.size.width - rhs.size.width) <= tolerance && abs(lhs.size.height - rhs.size.height) <= tolerance
     }
 
-    private func settleFrame(of window: AXUIElement, target: WindowFrame, within bounds: CGRect, attempts: Int = 4) {
-        // Leaving a system tile may restore an old frame after AX reports success.
-        // Correct position and size in one pass instead of separate delayed steps.
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self, self.isFocused(window), let actual = self.readFrame(of: window) else { return }
-            guard !self.framesMatch(actual, target) else { return }
-            guard attempts > 0 else {
-                NSLog("WindowKeys: window did not reach the requested frame after settling")
-                return
-            }
-            self.apply(target, to: window, within: bounds)
-            self.settleFrame(of: window, target: target, within: bounds, attempts: attempts - 1)
-        }
-        windowWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+    private func finishResize(of window: AXUIElement, target: WindowFrame, within bounds: CGRect) {
+        // Accept the final size and align once. Never restart resizing after the animation.
+        guard let actual = readFrame(of: window) else { return }
+        let centered = target.usingActualSize(actual.size, within: bounds)
+        setPosition(centered.origin, on: window, from: actual.origin)
     }
 
-    private func apply(_ frame: WindowFrame, to window: AXUIElement, within bounds: CGRect) {
-        guard let before = readFrame(of: window) else { return }
-        let requested = frame.usingActualSize(frame.size, within: bounds)
-        let sizeChanged = abs(before.size.width - requested.size.width) > 1 ||
-            abs(before.size.height - requested.size.height) > 1
+    private func applyAnimationFrame(_ frame: WindowFrame, to window: AXUIElement, previous: WindowFrame,
+                                     constraint: inout ResizeConstraint, within bounds: CGRect) -> WindowFrame? {
+        let size = constraint.sizeToRequest(frame.size)
+        let sizeChanged = abs(previous.size.width - size.width) > 2 || abs(previous.size.height - size.height) > 2
+        var actual = previous
         if sizeChanged {
-            // Make room before growing, but shrink before moving. Doing this per frame
-            // avoids asking macOS to grow a window beyond the current screen edge.
-            var preResizeOrigin = before.origin
-            if requested.size.width > before.size.width + 1 {
-                preResizeOrigin.x = min(before.origin.x, max(bounds.minX, bounds.maxX - requested.size.width))
+            var origin = previous.origin
+            if let predicted = constraint.predictedSize(size) {
+                origin = frame.usingActualSize(predicted, within: bounds).origin
+            } else {
+                if size.width > previous.size.width + 2 { origin.x = frame.origin.x }
+                if size.height > previous.size.height + 2 { origin.y = frame.origin.y }
             }
-            if requested.size.height > before.size.height + 1 {
-                preResizeOrigin.y = min(before.origin.y, max(bounds.minY, bounds.maxY - requested.size.height))
-            }
-            setPosition(preResizeOrigin, on: window, from: before.origin)
-            var size = requested.size
-            if let value = AXValueCreate(.cgSize, &size) {
-                AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value)
-            }
+            setPosition(origin, on: window, from: previous.origin)
+            setSize(size, on: window)
+            guard let accepted = readFrame(of: window) else { return nil }
+            actual = accepted
+            constraint.observe(previous: previous.size, requested: frame.size, actual: actual.size)
         }
+        let origin = frame.animationPosition(actualSize: actual.size, within: bounds)
+        setPosition(origin, on: window, from: actual.origin)
+        return readFrame(of: window)
+    }
 
-        // A window may impose a minimum size or macOS may restore its pre-tile frame.
-        // Anchor this frame's *actual* size on the moving center, not the requested size.
-        guard let actual = readFrame(of: window) else { return }
-        let positioned = requested.usingActualSize(actual.size, within: bounds)
-        setPosition(positioned.origin, on: window, from: actual.origin)
+    private func setSize(_ size: CGSize, on window: AXUIElement) {
+        var value = size
+        if let axValue = AXValueCreate(.cgSize, &value) {
+            AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, axValue)
+        }
     }
 
     private func setPosition(_ position: CGPoint, on window: AXUIElement, from current: CGPoint) {

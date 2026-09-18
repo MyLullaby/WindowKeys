@@ -29,7 +29,18 @@ func runChecks() -> Int32 {
     assert(constrained.origin == CGPoint(x: -1120, y: 190))
     let oversized = requested.usingActualSize(CGSize(width: 1800, height: 1100), within: bounds)
     assert(oversized.origin == bounds.origin)
-    print("PASS native command mapping and actual-size anchoring")
+    // Minimum-size windows keep the requested trajectory until the final alignment.
+    assert(requested.animationPosition(actualSize: CGSize(width: 800, height: 500), within: bounds) == requested.origin)
+    // Smaller accepted sizes (fixed width/height or aspect ratio) retain the moving center.
+    assert(requested.animationPosition(actualSize: CGSize(width: 400, height: 300), within: bounds) == CGPoint(x: -920, y: 290))
+    var constraint = ResizeConstraint()
+    constraint.observe(previous: CGSize(width: 800, height: 500), requested: CGSize(width: 900, height: 500), actual: CGSize(width: 800, height: 500))
+    assert(constraint.sizeToRequest(CGSize(width: 1000, height: 600)) == CGSize(width: 800, height: 600))
+    constraint.observe(previous: CGSize(width: 800, height: 500), requested: CGSize(width: 700, height: 400), actual: CGSize(width: 800, height: 500))
+    assert(constraint.sizeToRequest(CGSize(width: 700, height: 400)) == CGSize(width: 700, height: 400))
+    constraint.observe(previous: CGSize(width: 800, height: 400), requested: CGSize(width: 1000, height: 600), actual: CGSize(width: 1000, height: 500))
+    assert(constraint.predictedSize(CGSize(width: 900, height: 600)) == CGSize(width: 900, height: 450))
+    print("PASS native mapping, minimum-size trajectory, fixed-axis and aspect-ratio constraints")
     if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--geometry-only" { return 0 }
 
     guard CommandLine.arguments.count == 3, AXIsProcessTrusted() else {
@@ -110,7 +121,7 @@ func runChecks() -> Int32 {
     let centered = CGRect(x: area.midX - size.width / 2, y: area.midY - size.height / 2, width: size.width, height: size.height)
     let beforeResize = frame(window)
     guard perform(.resizeAndCenter) else { return 3 }
-    if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+    if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && enhancedBefore != true {
         // No timer tick yet: catches accidental removal of the resize animation.
         check("animated resize starts at the original frame", beforeResize)
         wait(0.08)
@@ -128,6 +139,10 @@ func runChecks() -> Int32 {
     }
     wait(1)
     check("animated resize finishes centered", centered)
+    for _ in 0..<5 {
+        wait(0.12)
+        check("completed resize stays still", centered)
+    }
     guard perform(.maximize) else { return 3 }
     wait(1)
     check("native maximize", filled, tolerance: 16)
