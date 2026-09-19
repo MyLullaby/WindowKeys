@@ -348,11 +348,14 @@ private struct ResizeConstraint {
 private final class WindowResizeAnimation: NSAnimation {
     private let applyFrame: (CGFloat) -> Bool
     private let completion: () -> Void
+    private var cleanup: (() -> Void)?
     private var finished = false
 
-    init(applyFrame: @escaping (CGFloat) -> Bool, completion: @escaping () -> Void) {
+    init(applyFrame: @escaping (CGFloat) -> Bool, completion: @escaping () -> Void,
+         cleanup: @escaping () -> Void) {
         self.applyFrame = applyFrame
         self.completion = completion
+        self.cleanup = cleanup
         super.init(duration: 0.3, animationCurve: .easeOut)
         animationBlockingMode = .nonblocking
         frameRate = Float(NSScreen.main?.maximumFramesPerSecond ?? 60)
@@ -360,9 +363,19 @@ private final class WindowResizeAnimation: NSAnimation {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    deinit { cleanup?() }
+
+    private func restoreState() {
+        let action = cleanup
+        cleanup = nil
+        action?()
+    }
+
     func cancel() {
+        guard !finished else { return }
         finished = true
         super.stop()
+        restoreState()
     }
 
     override var currentProgress: NSAnimation.Progress {
@@ -373,6 +386,7 @@ private final class WindowResizeAnimation: NSAnimation {
             if currentProgress >= 1 {
                 finished = true
                 super.stop()
+                defer { restoreState() }
                 completion()
             }
         }
@@ -415,9 +429,13 @@ private final class AccessibilityWindowController {
         return AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
     }
 
-    func perform(_ command: WindowCommand) {
+    func cancelResizeAnimation() {
         resizeAnimation?.cancel()
         resizeAnimation = nil
+    }
+
+    func perform(_ command: WindowCommand) {
+        cancelResizeAnimation()
         guard AXIsProcessTrusted() else {
             showAccessibilityAlert()
             return
@@ -638,22 +656,22 @@ private final class AccessibilityWindowController {
         let enhancedAttribute = "AXEnhancedUserInterface" as CFString
         AXUIElementCopyAttributeValue(application, enhancedAttribute, &enhancedValue)
         let enhancedUI = enhancedValue as? Bool == true
-        guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && !enhancedUI else {
-            // Match Loop's compatibility path. Keep this synchronous and restore the
-            // original flag in defer on every exit, including failed AX writes.
+        // This compatibility flag must not override the user's animation preference.
+        if enhancedUI {
+            AXUIElementSetAttributeValue(application, enhancedAttribute, kCFBooleanFalse)
+        }
+        let restoreEnhancedUI: () -> Void = {
             if enhancedUI {
-                AXUIElementSetAttributeValue(application, enhancedAttribute, kCFBooleanFalse)
-            }
-            defer {
-                if enhancedUI {
-                    AXUIElementSetAttributeValue(application, enhancedAttribute, kCFBooleanTrue)
-                    var restored: CFTypeRef?
-                    AXUIElementCopyAttributeValue(application, enhancedAttribute, &restored)
-                    if restored as? Bool != true {
-                        NSLog("WindowKeys: could not restore enhanced accessibility state")
-                    }
+                AXUIElementSetAttributeValue(application, enhancedAttribute, kCFBooleanTrue)
+                var restored: CFTypeRef?
+                AXUIElementCopyAttributeValue(application, enhancedAttribute, &restored)
+                if restored as? Bool != true {
+                    NSLog("WindowKeys: could not restore enhanced accessibility state")
                 }
             }
+        }
+        guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            defer { restoreEnhancedUI() }
             // At most two immediate applications, never a delayed resize loop.
             for _ in 0..<2 {
                 guard let actual = readFrame(of: window), !framesMatch(actual, target) else { break }
@@ -694,7 +712,7 @@ private final class AccessibilityWindowController {
             self.resizeAnimation = nil
             guard self.isFocused(window) else { return }
             self.finishResize(of: window, target: target, within: bounds)
-        })
+        }, cleanup: restoreEnhancedUI)
         resizeAnimation = animation
         animation.start()
     }
@@ -1497,6 +1515,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         alert.addButton(withTitle: "好")
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        AccessibilityWindowController.shared.cancelResizeAnimation()
     }
 
     @objc private func quit() {

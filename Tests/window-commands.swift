@@ -40,7 +40,24 @@ func runChecks() -> Int32 {
     assert(constraint.sizeToRequest(CGSize(width: 700, height: 400)) == CGSize(width: 700, height: 400))
     constraint.observe(previous: CGSize(width: 800, height: 400), requested: CGSize(width: 1000, height: 600), actual: CGSize(width: 1000, height: 500))
     assert(constraint.predictedSize(CGSize(width: 900, height: 600)) == CGSize(width: 900, height: 450))
-    print("PASS native mapping, minimum-size trajectory, fixed-axis and aspect-ratio constraints")
+    // State cleanup must run once on completion, cancellation, failed frames and release.
+    for outcome in ["completed", "cancelled", "failed", "released"] {
+        var cleanupCount = 0
+        var completionCount = 0
+        do {
+            let animation = WindowResizeAnimation(applyFrame: { _ in outcome != "failed" },
+                completion: { completionCount += 1 }, cleanup: { cleanupCount += 1 })
+            switch outcome {
+            case "completed": animation.currentProgress = 1
+            case "cancelled": animation.cancel(); animation.cancel()
+            case "failed": animation.currentProgress = 0.5
+            default: break
+            }
+        }
+        assert(cleanupCount == 1, "cleanup must run once: \(outcome)")
+        assert(completionCount == (outcome == "completed" ? 1 : 0))
+    }
+    print("PASS native mapping, resize constraints and animation state cleanup")
     if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--geometry-only" { return 0 }
 
     guard CommandLine.arguments.count == 3, AXIsProcessTrusted() else {
@@ -121,7 +138,7 @@ func runChecks() -> Int32 {
     let centered = CGRect(x: area.midX - size.width / 2, y: area.midY - size.height / 2, width: size.width, height: size.height)
     let beforeResize = frame(window)
     guard perform(.resizeAndCenter) else { return 3 }
-    if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion && enhancedBefore != true {
+    if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
         // No timer tick yet: catches accidental removal of the resize animation.
         check("animated resize starts at the original frame", beforeResize)
         wait(0.08)
