@@ -59,8 +59,8 @@ private enum WindowCommand: UInt32, CaseIterable {
         self == .fullscreen ? [.control, .shift] : [.control, .command]
     }
 
-    func matches(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
-        UInt16(self.keyCode) == keyCode && flags.intersection([.control, .command, .option, .shift]) == modifiers
+    var carbonModifiers: UInt32 {
+        self == .fullscreen ? UInt32(controlKey | shiftKey) : UInt32(controlKey | cmdKey)
     }
 }
 
@@ -1154,35 +1154,61 @@ private final class InputMethodSettingsWindowController: NSWindowController, NST
 }
 
 private final class GlobalHotKeyManager {
-    private var globalMonitor: Any?
-    private var localMonitor: Any?
+    private static let signature: OSType = 0x574B4559 // WKEY
+    private var eventHandler: EventHandlerRef?
+    private var registrations: [UInt32: EventHotKeyRef] = [:]
+    private var pressed: Set<UInt32> = []
+    private(set) var registrationFailures: [String] = []
     var onCommand: ((WindowCommand) -> Void)?
 
     init() {
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handle(event)
+        let events = [
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased))
+        ]
+        let status = events.withUnsafeBufferPointer { buffer in
+            InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
+                guard let event, let context else { return OSStatus(eventNotHandledErr) }
+                return Unmanaged<GlobalHotKeyManager>.fromOpaque(context).takeUnretainedValue().handle(event)
+            }, UInt32(buffer.count), buffer.baseAddress,
+            Unmanaged.passUnretained(self).toOpaque(), &eventHandler)
         }
-
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handle(event)
-            return event
+        guard status == noErr else {
+            registrationFailures.append("无法安装全局快捷键处理器（错误码 \(status)）")
+            return
         }
-
-        UserDefaults.standard.set(globalMonitor != nil, forKey: "GlobalKeyMonitorInstalled")
-        NSLog("WindowKeys: global key monitor installed=%@", globalMonitor == nil ? "false" : "true")
+        for command in WindowCommand.allCases {
+            var reference: EventHotKeyRef?
+            let identifier = EventHotKeyID(signature: Self.signature, id: command.rawValue)
+            let result = RegisterEventHotKey(command.keyCode, command.carbonModifiers, identifier,
+                                             GetApplicationEventTarget(), 0, &reference)
+            if result == noErr, let reference {
+                registrations[command.rawValue] = reference
+            } else {
+                registrationFailures.append("\(command.title)（错误码 \(result)）")
+                NSLog("WindowKeys: failed to register hotkey %@: %d", command.title, result)
+            }
+        }
     }
 
     deinit {
-        if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
-        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        for reference in registrations.values { UnregisterEventHotKey(reference) }
+        if let eventHandler { RemoveEventHandler(eventHandler) }
     }
 
-    private func handle(_ event: NSEvent) {
-        guard !event.isARepeat else { return }
-
-        guard let command = WindowCommand.allCases.first(where: {
-            $0.matches(keyCode: event.keyCode, flags: event.modifierFlags)
-        }) else { return }
+    private func handle(_ event: EventRef) -> OSStatus {
+        var identifier = EventHotKeyID()
+        let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                       nil, ByteCount(MemoryLayout<EventHotKeyID>.size), nil, &identifier)
+        guard status == noErr, identifier.signature == Self.signature,
+              registrations[identifier.id] != nil,
+              let command = WindowCommand(rawValue: identifier.id) else { return OSStatus(eventNotHandledErr) }
+        if GetEventKind(event) == UInt32(kEventHotKeyReleased) {
+            pressed.remove(identifier.id)
+            return noErr
+        }
+        guard GetEventKind(event) == UInt32(kEventHotKeyPressed) else { return OSStatus(eventNotHandledErr) }
+        guard pressed.insert(identifier.id).inserted else { return noErr }
 
         UserDefaults.standard.set(Int(command.rawValue), forKey: "LastHotKeyCommand")
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "LastHotKeyTimestamp")
@@ -1191,6 +1217,7 @@ private final class GlobalHotKeyManager {
         DispatchQueue.main.async { [weak self] in
             self?.onCommand?(command)
         }
+        return noErr
     }
 }
 
@@ -1223,6 +1250,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         UserDefaults.standard.set(AXIsProcessTrusted(), forKey: "AccessibilityTrustedAtLaunch")
 
         _ = AccessibilityWindowController.shared.requestAccessibilityIfNeeded()
+        if !hotKeyManager.registrationFailures.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "部分窗口快捷键注册失败"
+            alert.informativeText = hotKeyManager.registrationFailures.joined(separator: "\n") +
+                "\n请检查系统或其他工具是否已占用这些组合键，解除占用后重新启动 WindowKeys。失败的组合键未被 WindowKeys 接管，不会退回按键监听模式。"
+            alert.addButton(withTitle: "知道了")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
     }
 
     private func createStatusMenu() {

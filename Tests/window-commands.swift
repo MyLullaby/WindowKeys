@@ -24,12 +24,15 @@ func runChecks() -> Int32 {
     assert(WindowCommand.leftHalf.nativeMenuIdentifier == "_zoomLeft:")
     assert(WindowCommand.rightHalf.nativeMenuIdentifier == "_zoomRight:")
     assert(WindowCommand.fullscreen.nativeMenuIdentifier == nil)
-    assert(WindowCommand.fullscreen.matches(keyCode: UInt16(kVK_ANSI_F), flags: [.control, .shift]))
-    assert(!WindowCommand.fullscreen.matches(keyCode: UInt16(kVK_ANSI_F), flags: [.control, .command]))
-    assert(!WindowCommand.fullscreen.matches(keyCode: UInt16(kVK_ANSI_F), flags: [.control, .shift, .option]))
-    assert(!WindowCommand.fullscreen.matches(keyCode: UInt16(kVK_ANSI_F), flags: [.control, .shift, .command]))
-    assert(WindowCommand.maximize.matches(keyCode: UInt16(kVK_UpArrow), flags: [.control, .command]))
-    assert(!WindowCommand.maximize.matches(keyCode: UInt16(kVK_UpArrow), flags: [.control, .shift]))
+    assert(WindowCommand.fullscreen.keyCode == UInt32(kVK_ANSI_F))
+    assert(WindowCommand.fullscreen.carbonModifiers == UInt32(controlKey | shiftKey))
+    assert(WindowCommand.fullscreen.modifiers == [.control, .shift])
+    assert(WindowCommand.maximize.keyCode == UInt32(kVK_UpArrow))
+    assert(WindowCommand.maximize.carbonModifiers == UInt32(controlKey | cmdKey))
+    assert(WindowCommand.maximize.modifiers == [.control, .command])
+    let chords = WindowCommand.allCases.map { "\($0.keyCode):\($0.carbonModifiers)" }
+    assert(Set(chords).count == WindowCommand.allCases.count)
+    assert(WindowCommand.allCases.allSatisfy { $0.carbonModifiers != 0 }, "Never register bare keys")
     // State cleanup must run once on completion, cancellation, failed frames and release.
     for outcome in ["completed", "cancelled", "failed", "released"] {
         var cleanupCount = 0
