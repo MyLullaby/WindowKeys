@@ -18,28 +18,18 @@ func wait(_ seconds: Double) {
 }
 
 func runChecks() -> Int32 {
-    assert(WindowCommand.resizeAndCenter.nativeMenuIdentifier == nil)
+    assert(WindowCommand.resize.nativeMenuIdentifier == nil)
     assert(WindowCommand.center.nativeMenuIdentifier == "_zoomCenter:")
     assert(WindowCommand.maximize.nativeMenuIdentifier == "_zoomFill:")
     assert(WindowCommand.leftHalf.nativeMenuIdentifier == "_zoomLeft:")
     assert(WindowCommand.rightHalf.nativeMenuIdentifier == "_zoomRight:")
-    let bounds = CGRect(x: -1440, y: 40, width: 1440, height: 900)
-    let requested = WindowFrame(origin: CGPoint(x: -1020, y: 240), size: CGSize(width: 600, height: 400))
-    let constrained = requested.usingActualSize(CGSize(width: 800, height: 500), within: bounds)
-    assert(constrained.origin == CGPoint(x: -1120, y: 190))
-    let oversized = requested.usingActualSize(CGSize(width: 1800, height: 1100), within: bounds)
-    assert(oversized.origin == bounds.origin)
-    // Minimum-size windows keep the requested trajectory until the final alignment.
-    assert(requested.animationPosition(actualSize: CGSize(width: 800, height: 500), within: bounds) == requested.origin)
-    // Smaller accepted sizes (fixed width/height or aspect ratio) retain the moving center.
-    assert(requested.animationPosition(actualSize: CGSize(width: 400, height: 300), within: bounds) == CGPoint(x: -920, y: 290))
-    var constraint = ResizeConstraint()
-    constraint.observe(previous: CGSize(width: 800, height: 500), requested: CGSize(width: 900, height: 500), actual: CGSize(width: 800, height: 500))
-    assert(constraint.sizeToRequest(CGSize(width: 1000, height: 600)) == CGSize(width: 800, height: 600))
-    constraint.observe(previous: CGSize(width: 800, height: 500), requested: CGSize(width: 700, height: 400), actual: CGSize(width: 800, height: 500))
-    assert(constraint.sizeToRequest(CGSize(width: 700, height: 400)) == CGSize(width: 700, height: 400))
-    constraint.observe(previous: CGSize(width: 800, height: 400), requested: CGSize(width: 1000, height: 600), actual: CGSize(width: 1000, height: 500))
-    assert(constraint.predictedSize(CGSize(width: 900, height: 600)) == CGSize(width: 900, height: 450))
+    assert(WindowCommand.fullscreen.nativeMenuIdentifier == nil)
+    assert(WindowCommand.fullscreen.matches(keyCode: UInt16(kVK_ANSI_F), flags: [.control, .shift]))
+    assert(!WindowCommand.fullscreen.matches(keyCode: UInt16(kVK_ANSI_F), flags: [.control, .command]))
+    assert(!WindowCommand.fullscreen.matches(keyCode: UInt16(kVK_ANSI_F), flags: [.control, .shift, .option]))
+    assert(!WindowCommand.fullscreen.matches(keyCode: UInt16(kVK_ANSI_F), flags: [.control, .shift, .command]))
+    assert(WindowCommand.maximize.matches(keyCode: UInt16(kVK_UpArrow), flags: [.control, .command]))
+    assert(!WindowCommand.maximize.matches(keyCode: UInt16(kVK_UpArrow), flags: [.control, .shift]))
     // State cleanup must run once on completion, cancellation, failed frames and release.
     for outcome in ["completed", "cancelled", "failed", "released"] {
         var cleanupCount = 0
@@ -57,7 +47,7 @@ func runChecks() -> Int32 {
         assert(cleanupCount == 1, "cleanup must run once: \(outcome)")
         assert(completionCount == (outcome == "completed" ? 1 : 0))
     }
-    print("PASS native mapping, resize constraints and animation state cleanup")
+    print("PASS shortcut mapping and animation state cleanup")
     if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--geometry-only" { return 0 }
 
     guard CommandLine.arguments.count == 3, AXIsProcessTrusted() else {
@@ -135,9 +125,9 @@ func runChecks() -> Int32 {
     AXUIElementSetAttributeValue(window, "AXPosition" as CFString, AXValueCreate(.cgPoint, &setupPosition)!)
     wait(0.3)
     let size = CGSize(width: area.width * ResizePreferences.widthPercent / 100, height: area.height * ResizePreferences.heightPercent / 100)
-    let centered = CGRect(x: area.midX - size.width / 2, y: area.midY - size.height / 2, width: size.width, height: size.height)
     let beforeResize = frame(window)
-    guard perform(.resizeAndCenter) else { return 3 }
+    let resized = CGRect(origin: beforeResize.origin, size: size)
+    guard perform(.resize) else { return 3 }
     if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
         // No timer tick yet: catches accidental removal of the resize animation.
         check("animated resize starts at the original frame", beforeResize)
@@ -145,8 +135,8 @@ func runChecks() -> Int32 {
         let intermediate = frame(window)
         let moved = abs(intermediate.minX - beforeResize.minX) > 2 || abs(intermediate.minY - beforeResize.minY) > 2 ||
             abs(intermediate.width - beforeResize.width) > 2 || abs(intermediate.height - beforeResize.height) > 2
-        let finished = abs(intermediate.minX - centered.minX) <= 2 && abs(intermediate.minY - centered.minY) <= 2 &&
-            abs(intermediate.width - centered.width) <= 2 && abs(intermediate.height - centered.height) <= 2
+        let finished = abs(intermediate.minX - resized.minX) <= 2 && abs(intermediate.minY - resized.minY) <= 2 &&
+            abs(intermediate.width - resized.width) <= 2 && abs(intermediate.height - resized.height) <= 2
         if moved && !finished {
             print("PASS resize has an intermediate animation frame")
         } else {
@@ -155,17 +145,18 @@ func runChecks() -> Int32 {
         }
     }
     wait(1)
-    check("animated resize finishes centered", centered)
+    check("resize preserves the original position", resized)
     for _ in 0..<5 {
         wait(0.12)
-        check("completed resize stays still", centered)
+        check("completed resize stays still", resized)
     }
     guard perform(.maximize) else { return 3 }
     wait(1)
     check("native maximize", filled, tolerance: 16)
-    guard perform(.resizeAndCenter) else { return 3 }
+    guard perform(.resize) else { return 3 }
     wait(1)
-    check("resize after native tiling", centered)
+    let afterTiling = frame(window)
+    check("resize after native tiling (size only)", CGRect(origin: afterTiling.origin, size: size))
     AXUIElementSetAttributeValue(window, "AXPosition" as CFString, AXValueCreate(.cgPoint, &setupPosition)!)
     wait(0.3)
     let beforeCenter = frame(window)
@@ -174,9 +165,9 @@ func runChecks() -> Int32 {
     guard perform(.center) else { return 3 }
     wait(1)
     check("center with one command", expectedCenter)
-    AXUIElementSetAttributeValue(window, "AXPosition" as CFString, AXValueCreate(.cgPoint, &setupPosition)!)
+    AXUIElementSetAttributeValue(window, "AXSize" as CFString, AXValueCreate(.cgSize, &setupSize)!)
     wait(0.3)
-    guard perform(.resizeAndCenter) else { return 3 }
+    guard perform(.resize) else { return 3 }
     wait(0.04)
     guard perform(.maximize) else { return 3 }
     wait(1)

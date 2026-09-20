@@ -2,32 +2,37 @@
 
 [![Build](https://github.com/MyLullaby/WindowKeys/actions/workflows/build.yml/badge.svg)](https://github.com/MyLullaby/WindowKeys/actions/workflows/build.yml)
 
-一个只包含五个窗口动作的原生 macOS 菜单栏工具，编译目标为 Apple Silicon（arm64）。
+一个包含六个窗口动作的原生 macOS 菜单栏工具，编译目标为 Apple Silicon（arm64）。
 
 | 动作 | 全局快捷键 |
 |---|---|
-| 按自定义宽高比例调整并居中 | Control + Command + C |
+| 只按自定义宽高比例调整大小 | Control + Command + C |
 | macOS 原生居中 | Control + Command + ↓ |
 | macOS 原生填充 | Control + Command + ↑ |
 | macOS 原生左半屏 | Control + Command + ← |
 | macOS 原生右半屏 | Control + Command + → |
+| 进入/退出 macOS 原生全屏 | Control + Shift + F |
+
+Control + Shift + F 切换当前窗口的系统全屏状态（独立 Space），不是最大化填充；
+再次按下退出全屏。通过窗口的 `AXFullScreen` 属性请求系统处理，不自定义尺寸或动画。
+窗口不支持此属性时会提示音并记录日志。全局快捷键仍采用监听方式，不拦截目标应用的同名快捷键。
 
 四个方向键只触发目标应用的 macOS 原生窗口菜单命令，动画、最终位置和尺寸、平铺边距、
 台前调度行为全部由系统处理。不会主动展开应用菜单，也不会追加自定义尺寸补正。
 这些原生命令需要 macOS 15 或更新系统且目标应用提供对应菜单；找不到、禁用或调用失败时
 会发出提示音并记录日志，不再用自定义窗口调整兜底。系统接受命令后是否生效由系统处理。
 
-只有 C 的“调整大小并居中”使用自定义实现：通过 AppKit `NSAnimation` 执行约 0.3 秒的
-缓出动画，同时变化位置和大小。识别固定宽高和固定比例；窗口受最小尺寸限制时，动画中
-保持原定移动轨迹，不逐帧重新居中。结束后按实际尺寸做一次位置校准，不再每隔 120 毫秒
-重复修改大小，避免出现“动画结束后又分几段调整”。新动作或焦点变化会取消旧动画。
-菜单栏中的“调整大小并居中动画”只控制 C；
+只有 C 的“调整大小”使用自定义实现：通过 AppKit `NSAnimation` 执行约 0.3 秒的
+尺寸动画，只写窗口大小，不写位置、不自动居中，也不进行结束后的位置补正或尺寸重试。
+需要居中时，再按 Control + Command + ↓，交给 macOS 原生命令处理。
+窗口的最小尺寸、屏幕边缘限制及系统平铺恢复行为仍由目标应用和 macOS 决定；C 不会通过
+移动窗口来绕过这些限制，因此不保证所有窗口都能达到指定比例或绝对保持原位置。
+新动作或焦点变化会取消旧动画。菜单栏中的“调整大小动画”只控制 C；
 关闭该选项或系统开启“减少动态效果”时，C 直接调整，原生命令仍遵循系统自己的动画设置。
-实现参考了 [Loop 的窗口动画与尺寸限制处理](https://github.com/MrKai77/Loop/blob/df26d565e07c82e156b8f1c361bdcf428f32e3a4/Loop/Window%20Management/Window%20Manipulation/WindowTransformAnimation.swift)，
-未引入其依赖。增强辅助功能模式（`AXEnhancedUserInterface`）不再覆盖动画开关：
+保留原有的动画开关和宽高比例配置。增强辅助功能模式（`AXEnhancedUserInterface`）不覆盖动画开关：
 原本开启时，在调整期间临时关闭，动画完成、取消、失败或应用正常退出时恢复并检查；
 恢复失败会记录日志。只有关闭动画开关或启用系统“减少动态效果”才走直接调整路径，
-最多连续尝试两次，不做延时重试。
+直接调整路径仅发送一次尺寸请求。
 菜单栏中的“开机自动启动”使用 macOS 登录项机制，可随时开启或关闭；如果系统要求批准，
 应用会引导到“系统设置 → 通用 → 登录项与扩展”。
 
@@ -70,14 +75,14 @@ Apple Silicon 版本。可以在仓库的 [Actions](https://github.com/MyLullaby
 zsh Tests/run-window-commands.sh com.tencent.WeWorkMac '文档窗口标题'
 ```
 
-只检查原生命令映射和几何计算、不操作窗口时，可运行：
+只检查快捷键映射和动画状态恢复、不操作窗口时，可运行（保留原脚本参数）：
 
 ```sh
 zsh Tests/run-window-commands.sh --geometry-only
 ```
 
-脚本调用当前源码的窗口控制器，检查原生命令映射、最小尺寸下的移动轨迹、固定宽高和
-固定比例、自定义动画及结束后的稳定性、
+脚本调用当前源码的窗口控制器，检查快捷键映射、动画状态恢复、普通窗口缩放时保持位置、
+自定义尺寸动画及结束后的稳定性、
 最大化、退出平铺后的缩放、单次居中和动画中断。原生命令测试需要应用支持相应菜单。
 系统原生平铺的边距可配置，用例会读取当前设置，而非要求固定 8 像素。
 结束后恢复原窗口尺寸和位置。测试期间请勿切换窗口；前台变化会中止后续命令。

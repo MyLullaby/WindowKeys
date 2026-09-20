@@ -5,50 +5,62 @@ import ServiceManagement
 import UniformTypeIdentifiers
 
 private enum WindowCommand: UInt32, CaseIterable {
-    case resizeAndCenter = 1
+    case resize = 1
     case center
     case maximize
     case leftHalf
     case rightHalf
+    case fullscreen
 
     var title: String {
         switch self {
         case .center: return "居中"
-        case .resizeAndCenter: return "调整大小并居中"
+        case .resize: return "调整大小"
         case .maximize: return "最大化"
         case .leftHalf: return "左半屏"
         case .rightHalf: return "右半屏"
+        case .fullscreen: return "进入/退出全屏"
         }
     }
 
     var keyCode: UInt32 {
         switch self {
-        case .resizeAndCenter: return UInt32(kVK_ANSI_C)
+        case .resize: return UInt32(kVK_ANSI_C)
         case .center: return UInt32(kVK_DownArrow)
         case .maximize: return UInt32(kVK_UpArrow)
         case .leftHalf: return UInt32(kVK_LeftArrow)
         case .rightHalf: return UInt32(kVK_RightArrow)
+        case .fullscreen: return UInt32(kVK_ANSI_F)
         }
     }
 
     var keyEquivalent: String {
         switch self {
-        case .resizeAndCenter: return "c"
+        case .resize: return "c"
         case .center: return String(Character(UnicodeScalar(NSDownArrowFunctionKey)!))
         case .maximize: return String(Character(UnicodeScalar(NSUpArrowFunctionKey)!))
         case .leftHalf: return String(Character(UnicodeScalar(NSLeftArrowFunctionKey)!))
         case .rightHalf: return String(Character(UnicodeScalar(NSRightArrowFunctionKey)!))
+        case .fullscreen: return "f"
         }
     }
 
     var nativeMenuIdentifier: String? {
         switch self {
-        case .resizeAndCenter: return nil
+        case .resize, .fullscreen: return nil
         case .center: return "_zoomCenter:"
         case .maximize: return "_zoomFill:"
         case .leftHalf: return "_zoomLeft:"
         case .rightHalf: return "_zoomRight:"
         }
+    }
+
+    var modifiers: NSEvent.ModifierFlags {
+        self == .fullscreen ? [.control, .shift] : [.control, .command]
+    }
+
+    func matches(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
+        UInt16(self.keyCode) == keyCode && flags.intersection([.control, .command, .option, .shift]) == modifiers
     }
 }
 
@@ -275,74 +287,6 @@ private struct WindowFrame {
 
     var rect: CGRect { CGRect(origin: origin, size: size) }
 
-    func usingActualSize(_ actualSize: CGSize, within bounds: CGRect) -> WindowFrame {
-        WindowFrame(
-            origin: CGPoint(
-                x: rect.midX - actualSize.width / 2,
-                y: rect.midY - actualSize.height / 2
-            ),
-            size: actualSize
-        ).clamped(to: bounds)
-    }
-
-    func clamped(to bounds: CGRect) -> WindowFrame {
-        WindowFrame(origin: CGPoint(
-            x: min(max(origin.x, bounds.minX), max(bounds.minX, bounds.maxX - size.width)).rounded(),
-            y: min(max(origin.y, bounds.minY), max(bounds.minY, bounds.maxY - size.height)).rounded()
-        ), size: size)
-    }
-
-    func animationPosition(actualSize: CGSize, within bounds: CGRect) -> CGPoint {
-        // A minimum size must not pull the moving center around on every frame.
-        // Only compensate mid-animation for a size constrained below the request.
-        if actualSize.width <= size.width + 2 && actualSize.height <= size.height + 2 &&
-            (abs(actualSize.width - size.width) > 2 || abs(actualSize.height - size.height) > 2) {
-            return usingActualSize(actualSize, within: bounds).origin
-        }
-        return WindowFrame(origin: origin, size: actualSize).clamped(to: bounds).origin
-    }
-}
-
-// Resize constraints are learned from accepted frames, not from AX setter return codes.
-// This is limited to centered resizing; native actions handle edge/corner anchoring.
-private struct ResizeConstraint {
-    var fixedWidth: CGFloat?
-    var fixedHeight: CGFloat?
-    var aspectRatio: CGFloat?
-
-    func sizeToRequest(_ requested: CGSize) -> CGSize {
-        CGSize(width: fixedWidth ?? requested.width, height: fixedHeight ?? requested.height)
-    }
-
-    func predictedSize(_ requested: CGSize) -> CGSize? {
-        guard let ratio = aspectRatio else { return nil }
-        let width = min(requested.width, requested.height * ratio)
-        return CGSize(width: width, height: width / ratio)
-    }
-
-    mutating func observe(previous: CGSize, requested: CGSize, actual: CGSize) {
-        guard actual.width <= requested.width + 2, actual.height <= requested.height + 2 else {
-            self = ResizeConstraint()
-            return
-        }
-        let requestedWidthChanged = abs(requested.width - previous.width) > 2
-        let requestedHeightChanged = abs(requested.height - previous.height) > 2
-        let actualWidthChanged = abs(actual.width - previous.width) > 2
-        let actualHeightChanged = abs(actual.height - previous.height) > 2
-        let differsFromRequest = abs(actual.width - requested.width) > 2 || abs(actual.height - requested.height) > 2
-        if previous.width > 0, previous.height > 0, actual.width > 0, actual.height > 0,
-           differsFromRequest,
-           (requestedWidthChanged && requestedHeightChanged || actualWidthChanged || actualHeightChanged),
-           abs(actual.width / actual.height - previous.width / previous.height) <= 0.01 {
-            aspectRatio = actual.width / actual.height
-            fixedWidth = nil
-            fixedHeight = nil
-        } else if fixedWidth == nil && fixedHeight == nil {
-            if requestedWidthChanged && !actualWidthChanged { fixedWidth = actual.width }
-            if requestedHeightChanged && !actualHeightChanged { fixedHeight = actual.height }
-            if fixedWidth != nil || fixedHeight != nil { aspectRatio = nil }
-        }
-    }
 }
 
 private final class WindowResizeAnimation: NSAnimation {
@@ -446,6 +390,11 @@ private final class AccessibilityWindowController {
             return
         }
 
+        if command == .fullscreen {
+            toggleFullscreen(in: application)
+            return
+        }
+
         // System actions own their geometry, animation and tiling state completely.
         // Never follow them with our own resize, even if AXPress has no visible effect.
         if let identifier = command.nativeMenuIdentifier {
@@ -469,21 +418,11 @@ private final class AccessibilityWindowController {
             width: (workArea.width * CGFloat(ResizePreferences.widthPercent / 100)).rounded(),
             height: (workArea.height * CGFloat(ResizePreferences.heightPercent / 100)).rounded()
         )
-        let target = WindowFrame(
-            origin: CGPoint(x: workArea.midX - size.width / 2, y: workArea.midY - size.height / 2),
-            size: size
-        )
-
         guard isSettable(kAXSizeAttribute as CFString, on: window) else {
             NSSound.beep()
             return
         }
-        guard isSettable(kAXPositionAttribute as CFString, on: window) else {
-            NSSound.beep()
-            return
-        }
-
-        move(window, in: application, from: current, to: target, within: workArea)
+        resize(window, in: application, from: current.size, to: size)
     }
 
     private func focusedExternalApplication() -> AXUIElement? {
@@ -522,6 +461,25 @@ private final class AccessibilityWindowController {
             &windowValue
         ) == .success, let windowValue else { return nil }
         return (windowValue as! AXUIElement)
+    }
+
+    private func toggleFullscreen(in application: AXUIElement) {
+        let attribute = "AXFullScreen" as CFString
+        var value: CFTypeRef?
+        guard let window = focusedWindow(in: application),
+              isSettable(attribute, on: window),
+              AXUIElementCopyAttributeValue(window, attribute, &value) == .success,
+              let isFullscreen = value as? Bool else {
+            NSLog("WindowKeys: focused window does not support native fullscreen")
+            NSSound.beep()
+            return
+        }
+        // macOS owns the Space transition and animation; do not write window geometry.
+        let result = AXUIElementSetAttributeValue(window, attribute, isFullscreen ? kCFBooleanFalse : kCFBooleanTrue)
+        if result != .success {
+            NSLog("WindowKeys: fullscreen request failed with AX error %d", result.rawValue)
+            NSSound.beep()
+        }
     }
 
     private func performNativeWindowCommand(identifier: String, on application: AXUIElement) -> Bool {
@@ -643,14 +601,13 @@ private final class AccessibilityWindowController {
         return AXUIElementIsAttributeSettable(window, attribute, &settable) == .success && settable.boolValue
     }
 
-    private func move(
+    private func resize(
         _ window: AXUIElement,
         in application: AXUIElement,
-        from start: WindowFrame,
-        to target: WindowFrame,
-        within bounds: CGRect
+        from start: CGSize,
+        to target: CGSize
     ) {
-        guard !framesMatch(start, target) else { return }
+        guard abs(start.width - target.width) > 1 || abs(start.height - target.height) > 1 else { return }
 
         var enhancedValue: CFTypeRef?
         let enhancedAttribute = "AXEnhancedUserInterface" as CFString
@@ -672,46 +629,28 @@ private final class AccessibilityWindowController {
         }
         guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
             defer { restoreEnhancedUI() }
-            // At most two immediate applications, never a delayed resize loop.
-            for _ in 0..<2 {
-                guard let actual = readFrame(of: window), !framesMatch(actual, target) else { break }
-                setPosition(target.origin, on: window, from: actual.origin)
-                setSize(target.size, on: window)
-            }
-            finishResize(of: window, target: target, within: bounds)
+            setSize(target, on: window)
             return
         }
 
-        var lastFrame = start
-        var constraint = ResizeConstraint()
+        var lastRequested = start
         let animation = WindowResizeAnimation(applyFrame: { [weak self] eased in
             guard let self else { return false }
             guard self.isFocused(window) else {
                 self.resizeAnimation = nil
                 return false
             }
-            let frame = WindowFrame(
-                origin: CGPoint(
-                    x: (start.origin.x + (target.origin.x - start.origin.x) * eased).rounded(),
-                    y: (start.origin.y + (target.origin.y - start.origin.y) * eased).rounded()
-                ),
-                size: CGSize(
-                    width: (start.size.width + (target.size.width - start.size.width) * eased).rounded(),
-                    height: (start.size.height + (target.size.height - start.size.height) * eased).rounded()
-                )
+            let size = CGSize(
+                width: (start.width + (target.width - start.width) * eased).rounded(),
+                height: (start.height + (target.height - start.height) * eased).rounded()
             )
-            guard let accepted = self.applyAnimationFrame(frame, to: window, previous: lastFrame,
-                                                          constraint: &constraint, within: bounds) else {
-                self.resizeAnimation = nil
-                return false
+            if size != lastRequested {
+                self.setSize(size, on: window)
+                lastRequested = size
             }
-            lastFrame = accepted
             return true
         }, completion: { [weak self] in
-            guard let self else { return }
-            self.resizeAnimation = nil
-            guard self.isFocused(window) else { return }
-            self.finishResize(of: window, target: target, within: bounds)
+            self?.resizeAnimation = nil
         }, cleanup: restoreEnhancedUI)
         resizeAnimation = animation
         animation.start()
@@ -725,54 +664,10 @@ private final class AccessibilityWindowController {
         return CFEqual(focused, window)
     }
 
-    private func framesMatch(_ lhs: WindowFrame, _ rhs: WindowFrame, tolerance: CGFloat = 1) -> Bool {
-        abs(lhs.origin.x - rhs.origin.x) <= tolerance && abs(lhs.origin.y - rhs.origin.y) <= tolerance &&
-            abs(lhs.size.width - rhs.size.width) <= tolerance && abs(lhs.size.height - rhs.size.height) <= tolerance
-    }
-
-    private func finishResize(of window: AXUIElement, target: WindowFrame, within bounds: CGRect) {
-        // Accept the final size and align once. Never restart resizing after the animation.
-        guard let actual = readFrame(of: window) else { return }
-        let centered = target.usingActualSize(actual.size, within: bounds)
-        setPosition(centered.origin, on: window, from: actual.origin)
-    }
-
-    private func applyAnimationFrame(_ frame: WindowFrame, to window: AXUIElement, previous: WindowFrame,
-                                     constraint: inout ResizeConstraint, within bounds: CGRect) -> WindowFrame? {
-        let size = constraint.sizeToRequest(frame.size)
-        let sizeChanged = abs(previous.size.width - size.width) > 2 || abs(previous.size.height - size.height) > 2
-        var actual = previous
-        if sizeChanged {
-            var origin = previous.origin
-            if let predicted = constraint.predictedSize(size) {
-                origin = frame.usingActualSize(predicted, within: bounds).origin
-            } else {
-                if size.width > previous.size.width + 2 { origin.x = frame.origin.x }
-                if size.height > previous.size.height + 2 { origin.y = frame.origin.y }
-            }
-            setPosition(origin, on: window, from: previous.origin)
-            setSize(size, on: window)
-            guard let accepted = readFrame(of: window) else { return nil }
-            actual = accepted
-            constraint.observe(previous: previous.size, requested: frame.size, actual: actual.size)
-        }
-        let origin = frame.animationPosition(actualSize: actual.size, within: bounds)
-        setPosition(origin, on: window, from: actual.origin)
-        return readFrame(of: window)
-    }
-
     private func setSize(_ size: CGSize, on window: AXUIElement) {
         var value = size
         if let axValue = AXValueCreate(.cgSize, &value) {
             AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, axValue)
-        }
-    }
-
-    private func setPosition(_ position: CGPoint, on window: AXUIElement, from current: CGPoint) {
-        guard abs(position.x - current.x) > 1 || abs(position.y - current.y) > 1 else { return }
-        var origin = position
-        if let value = AXValueCreate(.cgPoint, &origin) {
-            AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
         }
     }
 
@@ -829,7 +724,7 @@ private final class ResizeSettingsWindowController: NSWindowController {
     private func configureContent() {
         guard let contentView = window?.contentView else { return }
 
-        let descriptionLabel = NSTextField(wrappingLabelWithString: "按 Control + Command + C 时，窗口会按当前屏幕可用区域的以下比例调整，并自动居中。")
+        let descriptionLabel = NSTextField(wrappingLabelWithString: "按 Control + Command + C 时，只按以下比例调整窗口大小；需要居中时，再按 Control + Command + ↓。")
         descriptionLabel.textColor = .secondaryLabelColor
 
         configure(widthSlider, action: #selector(sliderChanged(_:)))
@@ -1285,14 +1180,8 @@ private final class GlobalHotKeyManager {
     private func handle(_ event: NSEvent) {
         guard !event.isARepeat else { return }
 
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard flags.contains(.control),
-              flags.contains(.command),
-              !flags.contains(.option),
-              !flags.contains(.shift) else { return }
-
         guard let command = WindowCommand.allCases.first(where: {
-            UInt16($0.keyCode) == event.keyCode
+            $0.matches(keyCode: event.keyCode, flags: event.modifierFlags)
         }) else { return }
 
         UserDefaults.standard.set(Int(command.rawValue), forKey: "LastHotKeyCommand")
@@ -1354,7 +1243,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             )
             item.target = self
             item.tag = Int(command.rawValue)
-            item.keyEquivalentModifierMask = [.control, .command]
+            item.keyEquivalentModifierMask = command.modifiers
             menu.addItem(item)
         }
 
@@ -1368,7 +1257,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(sizeSettingsItem)
 
         animationItem = NSMenuItem(
-            title: "调整大小并居中动画",
+            title: "调整大小动画",
             action: #selector(toggleAnimation(_:)),
             keyEquivalent: ""
         )
