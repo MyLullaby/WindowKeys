@@ -1170,7 +1170,7 @@ private final class GlobalHotKeyManager {
             InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
                 guard let event, let context else { return OSStatus(eventNotHandledErr) }
                 return Unmanaged<GlobalHotKeyManager>.fromOpaque(context).takeUnretainedValue().handle(event)
-            }, UInt32(buffer.count), buffer.baseAddress,
+            }, buffer.count, buffer.baseAddress,
             Unmanaged.passUnretained(self).toOpaque(), &eventHandler)
         }
         guard status == noErr else {
@@ -1199,7 +1199,7 @@ private final class GlobalHotKeyManager {
     private func handle(_ event: EventRef) -> OSStatus {
         var identifier = EventHotKeyID()
         let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
-                                       nil, ByteCount(MemoryLayout<EventHotKeyID>.size), nil, &identifier)
+                                       nil, MemoryLayout<EventHotKeyID>.size, nil, &identifier)
         guard status == noErr, identifier.signature == Self.signature,
               registrations[identifier.id] != nil,
               let command = WindowCommand(rawValue: identifier.id) else { return OSStatus(eventNotHandledErr) }
