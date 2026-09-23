@@ -368,6 +368,18 @@ private final class AccessibilityWindowController {
         }
     }
 
+    // Settings become frontmost themselves; retain the last external app as the target.
+    func currentExternalApplication() -> NSRunningApplication? {
+        if let app = NSWorkspace.shared.frontmostApplication,
+           app.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            lastExternalPID = app.processIdentifier
+        }
+        guard let lastExternalPID,
+              let app = NSRunningApplication(processIdentifier: lastExternalPID),
+              !app.isTerminated else { return nil }
+        return app
+    }
+
     func requestAccessibilityIfNeeded() -> Bool {
         let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
         return AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
@@ -873,6 +885,7 @@ private final class InputMethodSettingsWindowController: NSWindowController, NST
     }
 
     override func showWindow(_ sender: Any?) {
+        _ = AccessibilityWindowController.shared.currentExternalApplication()
         reloadConfiguration()
         super.showWindow(sender)
         window?.center()
@@ -939,16 +952,24 @@ private final class InputMethodSettingsWindowController: NSWindowController, NST
         )
         addButton.bezelStyle = .rounded
 
+        let detectButton = NSButton(
+            title: "添加当前应用",
+            target: self,
+            action: #selector(addCurrentApplication)
+        )
+        detectButton.bezelStyle = .rounded
+        detectButton.toolTip = "添加最近使用的应用（不包括 WindowKeys），然后在列表中选择输入法。"
+
         let hintLabel = NSTextField(labelWithString: "删除专属配置后，该应用会自动使用默认输入法。")
         hintLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         hintLabel.textColor = .tertiaryLabelColor
 
-        let footer = NSStackView(views: [addButton, hintLabel, NSView()])
+        let footer = NSStackView(views: [detectButton, addButton, NSView()])
         footer.orientation = .horizontal
         footer.alignment = .centerY
         footer.spacing = 12
 
-        let stack = NSStackView(views: [descriptionLabel, defaultRow, rulesLabel, scrollView, footer])
+        let stack = NSStackView(views: [descriptionLabel, defaultRow, rulesLabel, scrollView, footer, hintLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
@@ -964,7 +985,7 @@ private final class InputMethodSettingsWindowController: NSWindowController, NST
             defaultRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             rulesLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scrollView.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 240),
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 180),
             footer.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
     }
@@ -1096,6 +1117,15 @@ private final class InputMethodSettingsWindowController: NSWindowController, NST
         onConfigurationChange?()
     }
 
+    @objc private func addCurrentApplication() {
+        guard let app = AccessibilityWindowController.shared.currentExternalApplication(),
+              let bundleIdentifier = app.bundleIdentifier, !bundleIdentifier.isEmpty else {
+            showError(message: "未能识别当前应用。请先切换到目标应用，再返回此窗口重试，或使用“添加应用…”手动选择。")
+            return
+        }
+        addRule(for: bundleIdentifier)
+    }
+
     @objc private func addApplication() {
         guard let window else { return }
         let panel = NSOpenPanel()
@@ -1113,10 +1143,18 @@ private final class InputMethodSettingsWindowController: NSWindowController, NST
                 self.showError(message: "无法读取所选应用的 Bundle ID。")
                 return
             }
-            guard bundleIdentifier != Bundle.main.bundleIdentifier else {
-                self.showError(message: "WindowKeys 自身不会触发输入法切换，无需添加配置。")
-                return
-            }
+            self.addRule(for: bundleIdentifier)
+        }
+    }
+
+    fileprivate func addRule(for bundleIdentifier: String) {
+        guard bundleIdentifier != Bundle.main.bundleIdentifier else {
+            showError(message: "WindowKeys 自身不会触发输入法切换，无需添加配置。")
+            return
+        }
+        reloadConfiguration()
+        // Re-adding an application must not replace its existing input source.
+        if InputMethodPreferences.appOverrides[bundleIdentifier] == nil {
             let validDefaultIdentifier = InputMethodPreferences.defaultSourceIdentifier.flatMap { identifier in
                 self.inputSources.contains(where: { $0.identifier == identifier }) ? identifier : nil
             }
@@ -1130,6 +1168,10 @@ private final class InputMethodSettingsWindowController: NSWindowController, NST
             InputMethodPreferences.setOverride(sourceIdentifier, for: bundleIdentifier)
             self.reloadConfiguration()
             self.onConfigurationChange?()
+        }
+        if let row = rules.firstIndex(where: { $0.bundleIdentifier == bundleIdentifier }) {
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            tableView.scrollRowToVisible(row)
         }
     }
 
