@@ -21,6 +21,9 @@ jobs:
       - name: Build app
         run: ./build.sh
 
+      - name: Test translation payloads
+        run: zsh Tests/run-translation.sh
+
       - name: Verify app bundle
         run: |
           test -x build/WindowKeys.app/Contents/MacOS/WindowKeys

@@ -19,6 +19,7 @@ xcrun swiftc \
   -framework Carbon \
   -framework ServiceManagement \
   "$project_dir/Sources/WindowKeys/main.swift" \
+  "$project_dir/Sources/WindowKeys/Translation.swift" \
   -o "$macos_dir/WindowKeys"
 
 codesign --force --sign - --identifier com.bland.windowkeys "$app_dir"
