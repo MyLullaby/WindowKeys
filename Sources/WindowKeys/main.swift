@@ -506,11 +506,15 @@ private final class AccessibilityWindowController {
             return
         }
 
-        // System actions own their geometry, animation and tiling state completely.
-        // Never follow them with our own resize, even if AXPress has no visible effect.
+        // Prefer native tiling to preserve system animation/tiling state. If the
+        // menu action is unavailable or fails, the fallback below uses AX geometry.
         if let identifier = command.nativeMenuIdentifier {
             if !performNativeWindowCommand(identifier: identifier, on: application) {
-                NSSound.beep()
+                // Some apps do not expose the system's tiling menu through Accessibility.
+                // Fall back to public AX position/size setters when the window supports them.
+                if !performCustomGeometryCommand(command, in: application) {
+                    NSSound.beep()
+                }
             }
             return
         }
@@ -575,6 +579,79 @@ private final class AccessibilityWindowController {
             &windowValue
         ) == .success, let windowValue else { return nil }
         return (windowValue as! AXUIElement)
+    }
+
+    private func performCustomGeometryCommand(_ command: WindowCommand, in application: AXUIElement) -> Bool {
+        guard let window = focusedWindow(in: application), let current = readFrame(of: window),
+              let workArea = workAreaContaining(current.rect) else {
+            diagnosticLog("WindowKeys: custom geometry fallback cannot read focused window or screen")
+            return false
+        }
+
+        let target: CGRect
+        switch command {
+        case .center:
+            target = CGRect(x: workArea.midX - current.size.width / 2,
+                            y: workArea.midY - current.size.height / 2,
+                            width: current.size.width, height: current.size.height)
+        case .maximize:
+            target = workArea.insetBy(dx: tiledWindowPadding, dy: tiledWindowPadding)
+        case .leftHalf, .rightHalf:
+            let padding = tiledWindowPadding
+            let paneWidth = max(1, (workArea.width - padding * 3) / 2)
+            let x = command == .leftHalf ? workArea.minX + padding : workArea.midX + padding / 2
+            target = CGRect(x: x, y: workArea.minY + padding,
+                            width: paneWidth, height: max(1, workArea.height - padding * 2))
+        case .resize, .fullscreen:
+            return false
+        }
+
+        guard isSettable(kAXSizeAttribute as CFString, on: window),
+              isSettable(kAXPositionAttribute as CFString, on: window) else {
+            diagnosticLog("WindowKeys: custom geometry fallback unsupported for command %u (position/size not settable)", command.rawValue)
+            return false
+        }
+        guard setFrame(target, on: window) else { return false }
+        diagnosticLog("WindowKeys: custom geometry fallback applied for command %u", command.rawValue)
+        return true
+    }
+
+    private var tiledWindowPadding: CGFloat {
+        let settings = UserDefaults(suiteName: "com.apple.WindowManager")
+        let enabled = settings?.object(forKey: "EnableTiledWindowMargins") as? Bool ?? true
+        return enabled ? CGFloat((settings?.object(forKey: "TiledWindowSpacing") as? NSNumber)?.doubleValue ?? 8) : 0
+    }
+
+    @discardableResult
+    private func setFrame(_ frame: CGRect, on window: AXUIElement) -> Bool {
+        var size = frame.size
+        var position = frame.origin
+        guard let sizeValue = AXValueCreate(.cgSize, &size),
+              let positionValue = AXValueCreate(.cgPoint, &position) else { return false }
+
+        // Resize first, then place: some apps reposition windows when their size changes.
+        let sizeResult = AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
+        guard sizeResult == .success else {
+            diagnosticLog("WindowKeys: fallback setting window size failed with AX error %d", sizeResult.rawValue)
+            return false
+        }
+        let positionResult = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
+        guard positionResult == .success else {
+            diagnosticLog("WindowKeys: fallback setting window position failed with AX error %d", positionResult.rawValue)
+            return false
+        }
+        guard let actual = readFrame(of: window) else {
+            diagnosticLog("WindowKeys: fallback could not verify resulting window frame")
+            return false
+        }
+        let matches = abs(actual.origin.x - frame.origin.x) <= 2 && abs(actual.origin.y - frame.origin.y) <= 2 &&
+            abs(actual.size.width - frame.size.width) <= 2 && abs(actual.size.height - frame.size.height) <= 2
+        if !matches {
+            diagnosticLog("WindowKeys: fallback frame constrained by target app (requested %.0f,%.0f %.0fx%.0f; got %.0f,%.0f %.0fx%.0f)",
+                          frame.origin.x, frame.origin.y, frame.width, frame.height,
+                          actual.origin.x, actual.origin.y, actual.size.width, actual.size.height)
+        }
+        return matches
     }
 
     private func toggleFullscreen(in application: AXUIElement) {
