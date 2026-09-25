@@ -4,6 +4,66 @@ import Carbon
 import ServiceManagement
 import UniformTypeIdentifiers
 
+// All callers run on the main thread. Write each entry immediately so a later
+// crash does not discard an in-memory queue; keep at most two 1 MiB files.
+private final class DiagnosticLog {
+    static let shared = DiagnosticLog(directory: FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/WindowKeys", isDirectory: true))
+    static var isEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "diagnosticLoggingEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "diagnosticLoggingEnabled") }
+    }
+    private let directory: URL
+    private let limit = 1_048_576
+    private var current: URL { directory.appendingPathComponent("current.log") }
+    private var previous: URL { directory.appendingPathComponent("previous.log") }
+
+    init(directory: URL) { self.directory = directory }
+
+    func write(_ message: String) {
+        guard Self.isEnabled else { return }
+        do {
+            let files = FileManager.default
+            try files.createDirectory(at: directory, withIntermediateDirectories: true,
+                                      attributes: [.posixPermissions: 0o700])
+            let line = "\(ISO8601DateFormatter().string(from: Date())) \(message.prefix(4096))\n"
+            let data = Data(line.utf8)
+            let size = (try? files.attributesOfItem(atPath: current.path)[.size] as? NSNumber)?.intValue ?? 0
+            if size + data.count > limit {
+                if files.fileExists(atPath: previous.path) { try files.removeItem(at: previous) }
+                try files.moveItem(at: current, to: previous)
+            }
+            if !files.fileExists(atPath: current.path) {
+                guard files.createFile(atPath: current.path, contents: nil,
+                                       attributes: [.posixPermissions: 0o600]) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+            }
+            let handle = try FileHandle(forWritingTo: current)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {
+            NSLog("WindowKeys: cannot save diagnostic log: %@", error.localizedDescription)
+        }
+    }
+
+    func export(to destination: URL) throws {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        var data = Data("WindowKeys \(version)\n\(ProcessInfo.processInfo.operatingSystemVersionString)\nExported: \(Date())\nLogging enabled: \(Self.isEnabled)\nInput switching enabled: \(InputMethodPreferences.isEnabled)\nAccessibility trusted: \(AXIsProcessTrusted())\nLogs contain app/input-source identifiers, not typed text or window titles.\n\n".utf8)
+        for url in [previous, current] where FileManager.default.fileExists(atPath: url.path) {
+            data.append(try Data(contentsOf: url))
+        }
+        try data.write(to: destination, options: .atomic)
+    }
+}
+
+private func diagnosticLog(_ format: String, _ arguments: CVarArg...) {
+    let message = String(format: format, arguments: arguments)
+    NSLog("%@", message)
+    DiagnosticLog.shared.write(message)
+}
+
 private enum WindowCommand: UInt32, CaseIterable {
     case resize = 1
     case center
@@ -106,6 +166,11 @@ private struct InputSourceTarget {
 }
 
 private enum InputMethodPreferences {
+    static var isEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: "inputMethodSwitchingEnabled") }
+        set { UserDefaults.standard.set(newValue, forKey: "inputMethodSwitchingEnabled") }
+    }
+
     private static let defaultSourceKey = "defaultInputSourceID"
     private static let appOverridesKey = "appInputSourceOverrides"
 
@@ -120,7 +185,8 @@ private enum InputMethodPreferences {
     }
 
     static func sourceIdentifier(for bundleIdentifier: String) -> String? {
-        appOverrides[bundleIdentifier] ?? defaultSourceIdentifier
+        guard isEnabled else { return nil }
+        return appOverrides[bundleIdentifier] ?? defaultSourceIdentifier
     }
 
     static func setOverride(_ sourceIdentifier: String, for bundleIdentifier: String) {
@@ -142,7 +208,8 @@ private enum InputSourceCatalog {
             kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource!,
             kTISPropertyInputSourceIsSelectCapable as String: true
         ] as CFDictionary
-        let sources = TISCreateInputSourceList(properties, false).takeRetainedValue() as NSArray
+        guard let result = TISCreateInputSourceList(properties, false) else { return [] }
+        let sources = result.takeRetainedValue() as NSArray
         var descriptors: [InputSourceDescriptor] = []
         var seenIdentifiers = Set<String>()
 
@@ -159,13 +226,15 @@ private enum InputSourceCatalog {
     }
 
     static func currentInputSourceIdentifier() -> String? {
-        let source = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+        guard let result = TISCopyCurrentKeyboardInputSource() else { return nil }
+        let source = result.takeRetainedValue()
         return property(source, key: kTISPropertyInputSourceID)
     }
 
     static func selectionTarget(identifier: String) -> InputSourceTarget? {
         let properties = [kTISPropertyInputSourceID as String: identifier] as CFDictionary
-        let sources = TISCreateInputSourceList(properties, false).takeRetainedValue() as NSArray
+        guard let result = TISCreateInputSourceList(properties, false) else { return nil }
+        let sources = result.takeRetainedValue() as NSArray
         let matches = (sources as? [TISInputSource] ?? []).filter {
             property($0, key: kTISPropertyInputSourceIsSelectCapable) as Bool? == true &&
                 property($0, key: kTISPropertyInputSourceIsEnabled) as Bool? == true
@@ -183,8 +252,10 @@ private enum InputSourceCatalog {
         )
     }
 
-    static func currentInputSourceMatches(_ target: InputSourceTarget) -> Bool {
-        let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+    static func currentInputSourceMatches(_ target: InputSourceTarget) -> Bool? {
+        // A failed read is not evidence that a toggle is needed.
+        guard let result = TISCopyCurrentKeyboardInputSource() else { return nil }
+        let current = result.takeRetainedValue()
         guard property(current, key: kTISPropertyInputSourceID) as String? == target.sourceIdentifier else {
             return false
         }
@@ -206,6 +277,7 @@ private final class InputMethodManager {
     private var switchWorkItem: DispatchWorkItem?
 
     init() {
+        guard InputMethodPreferences.isEnabled else { return }
         if InputMethodPreferences.defaultSourceIdentifier == nil {
             InputMethodPreferences.defaultSourceIdentifier = InputSourceCatalog.currentInputSourceIdentifier()
                 ?? InputSourceCatalog.availableInputSources().first?.identifier
@@ -237,7 +309,8 @@ private final class InputMethodManager {
 
     private func scheduleInputSource(for app: NSRunningApplication) {
         switchWorkItem?.cancel()
-        guard app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+        guard InputMethodPreferences.isEnabled,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
               app.bundleIdentifier != nil else { return }
         let workItem = DispatchWorkItem { [weak self] in
             guard let self,
@@ -250,17 +323,29 @@ private final class InputMethodManager {
     }
 
     private func switchInputSourceIfNeeded(for app: NSRunningApplication) {
-        guard let bundleIdentifier = app.bundleIdentifier,
-              let targetIdentifier = InputMethodPreferences.sourceIdentifier(for: bundleIdentifier),
-              let target = InputSourceCatalog.selectionTarget(identifier: targetIdentifier) else { return }
-        guard !InputSourceCatalog.currentInputSourceMatches(target) else { return }
+        guard InputMethodPreferences.isEnabled,
+              let bundleIdentifier = app.bundleIdentifier,
+              let targetIdentifier = InputMethodPreferences.sourceIdentifier(for: bundleIdentifier) else { return }
+        diagnosticLog("WindowKeys: checking input source for %@; target=%@", bundleIdentifier, targetIdentifier)
+        guard let target = InputSourceCatalog.selectionTarget(identifier: targetIdentifier) else {
+            diagnosticLog("WindowKeys: target input source unavailable")
+            return
+        }
+        guard let matches = InputSourceCatalog.currentInputSourceMatches(target) else {
+            diagnosticLog("WindowKeys: cannot read current input source; skipping switch")
+            return
+        }
+        guard !matches else {
+            diagnosticLog("WindowKeys: input source already matches; skipping switch")
+            return
+        }
         guard AXIsProcessTrusted(),
               let eventSource = CGEventSource(stateID: .hidSystemState),
               let controlDown = CGEvent(keyboardEventSource: eventSource, virtualKey: CGKeyCode(kVK_Control), keyDown: true),
               let spaceDown = CGEvent(keyboardEventSource: eventSource, virtualKey: CGKeyCode(kVK_Space), keyDown: true),
               let spaceUp = CGEvent(keyboardEventSource: eventSource, virtualKey: CGKeyCode(kVK_Space), keyDown: false),
               let controlUp = CGEvent(keyboardEventSource: eventSource, virtualKey: CGKeyCode(kVK_Control), keyDown: false) else {
-            NSLog("WindowKeys: cannot send input source shortcut for %@", bundleIdentifier)
+            diagnosticLog("WindowKeys: cannot send input source shortcut for %@", bundleIdentifier)
             return
         }
 
@@ -270,11 +355,18 @@ private final class InputMethodManager {
         controlUp.flags = []
 
         let events = [controlDown, spaceDown, spaceUp, controlUp]
+        var started = false
         for (index, event) in events.enumerated() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.02) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.02) { [weak self] in
+                if index == 0 {
+                    guard self != nil, InputMethodPreferences.isEnabled else { return }
+                    started = true
+                }
+                // Once started, finish the key-up events even if disabled in between.
+                guard started else { return }
                 event.post(tap: .cghidEventTap)
                 if index == events.count - 1 {
-                    NSLog("WindowKeys: sent Control-Space for %@ to switch to %@", bundleIdentifier, targetIdentifier)
+                    diagnosticLog("WindowKeys: sent Control-Space for %@ to switch to %@", bundleIdentifier, targetIdentifier)
                 }
             }
         }
@@ -391,16 +483,23 @@ private final class AccessibilityWindowController {
     }
 
     func perform(_ command: WindowCommand) {
+        diagnosticLog("WindowKeys: requested window command %u", command.rawValue)
         cancelResizeAnimation()
         guard AXIsProcessTrusted() else {
+            diagnosticLog("WindowKeys: accessibility permission missing")
             showAccessibilityAlert()
             return
         }
 
         guard let application = focusedExternalApplication() else {
+            diagnosticLog("WindowKeys: no focused external application")
             NSSound.beep()
             return
         }
+        var targetPID: pid_t = 0
+        AXUIElementGetPid(application, &targetPID)
+        diagnosticLog("WindowKeys: target app %@; pid=%d",
+                      NSRunningApplication(processIdentifier: targetPID)?.bundleIdentifier ?? "unknown", targetPID)
 
         if command == .fullscreen {
             toggleFullscreen(in: application)
@@ -417,11 +516,13 @@ private final class AccessibilityWindowController {
         }
 
         guard let window = focusedWindow(in: application), let current = readFrame(of: window) else {
+            diagnosticLog("WindowKeys: cannot read focused window geometry")
             NSSound.beep()
             return
         }
 
         guard let workArea = workAreaContaining(current.rect) else {
+            diagnosticLog("WindowKeys: cannot find window screen")
             NSSound.beep()
             return
         }
@@ -431,6 +532,7 @@ private final class AccessibilityWindowController {
             height: (workArea.height * CGFloat(ResizePreferences.heightPercent / 100)).rounded()
         )
         guard isSettable(kAXSizeAttribute as CFString, on: window) else {
+            diagnosticLog("WindowKeys: window size is not settable")
             NSSound.beep()
             return
         }
@@ -482,14 +584,14 @@ private final class AccessibilityWindowController {
               isSettable(attribute, on: window),
               AXUIElementCopyAttributeValue(window, attribute, &value) == .success,
               let isFullscreen = value as? Bool else {
-            NSLog("WindowKeys: focused window does not support native fullscreen")
+            diagnosticLog("WindowKeys: focused window does not support native fullscreen")
             NSSound.beep()
             return
         }
         // macOS owns the Space transition and animation; do not write window geometry.
         let result = AXUIElementSetAttributeValue(window, attribute, isFullscreen ? kCFBooleanFalse : kCFBooleanTrue)
         if result != .success {
-            NSLog("WindowKeys: fullscreen request failed with AX error %d", result.rawValue)
+            diagnosticLog("WindowKeys: fullscreen request failed with AX error %d", result.rawValue)
             NSSound.beep()
         }
     }
@@ -502,29 +604,29 @@ private final class AccessibilityWindowController {
             &menuBarValue
         ) == .success,
         let menuBarValue else {
-            NSLog("WindowKeys: native command %@ has no accessible menu bar", identifier)
+            diagnosticLog("WindowKeys: native command %@ has no accessible menu bar", identifier)
             return false
         }
 
         let menuBar = menuBarValue as! AXUIElement
         guard let item = findElement(identifier: identifier, under: menuBar, depth: 0) else {
-            NSLog("WindowKeys: native command %@ was not found", identifier)
+            diagnosticLog("WindowKeys: native command %@ was not found", identifier)
             return false
         }
 
         var enabled: CFTypeRef?
         guard AXUIElementCopyAttributeValue(item, kAXEnabledAttribute as CFString, &enabled) == .success,
               enabled as? Bool == true else {
-            NSLog("WindowKeys: native command %@ is unavailable", identifier)
+            diagnosticLog("WindowKeys: native command %@ is unavailable", identifier)
             return false
         }
         let result = AXUIElementPerformAction(item, kAXPressAction as CFString)
         if result == .success {
-            NSLog("WindowKeys: performed native command %@", identifier)
+            diagnosticLog("WindowKeys: performed native command %@", identifier)
             return true
         }
 
-        NSLog("WindowKeys: native command %@ failed with AX error %d", identifier, result.rawValue)
+        diagnosticLog("WindowKeys: native command %@ failed with AX error %d", identifier, result.rawValue)
         return false
     }
 
@@ -635,7 +737,7 @@ private final class AccessibilityWindowController {
                 var restored: CFTypeRef?
                 AXUIElementCopyAttributeValue(application, enhancedAttribute, &restored)
                 if restored as? Bool != true {
-                    NSLog("WindowKeys: could not restore enhanced accessibility state")
+                    diagnosticLog("WindowKeys: could not restore enhanced accessibility state")
                 }
             }
         }
@@ -679,7 +781,10 @@ private final class AccessibilityWindowController {
     private func setSize(_ size: CGSize, on window: AXUIElement) {
         var value = size
         if let axValue = AXValueCreate(.cgSize, &value) {
-            AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, axValue)
+            let result = AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, axValue)
+            if result != .success {
+                diagnosticLog("WindowKeys: setting window size failed with AX error %d", result.rawValue)
+            }
         }
     }
 
@@ -897,7 +1002,7 @@ private final class InputMethodSettingsWindowController: NSWindowController, NST
         guard let contentView = window?.contentView else { return }
 
         let descriptionLabel = NSTextField(
-            wrappingLabelWithString: "切换应用时，WindowKeys 会优先使用应用的专属配置；没有专属配置时使用默认输入法。"
+            wrappingLabelWithString: "在菜单栏勾选“自动切换输入法”后生效：优先使用应用专属配置，否则使用默认输入法。关闭开关会保留配置，但不自动切换。"
         )
         descriptionLabel.textColor = .secondaryLabelColor
 
@@ -1228,7 +1333,7 @@ private final class GlobalHotKeyManager {
                 registrations[command.rawValue] = reference
             } else {
                 registrationFailures.append("\(command.title)（错误码 \(result)）")
-                NSLog("WindowKeys: failed to register hotkey %@: %d", command.title, result)
+                diagnosticLog("WindowKeys: failed to register hotkey %@: %d", command.title, result)
             }
         }
     }
@@ -1254,7 +1359,7 @@ private final class GlobalHotKeyManager {
 
         UserDefaults.standard.set(Int(command.rawValue), forKey: "LastHotKeyCommand")
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "LastHotKeyTimestamp")
-        NSLog("WindowKeys: received hotkey for command %u", command.rawValue)
+        diagnosticLog("WindowKeys: received hotkey for command %u", command.rawValue)
 
         DispatchQueue.main.async { [weak self] in
             self?.onCommand?(command)
@@ -1269,11 +1374,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var statusItem: NSStatusItem!
     private var sizeSettingsItem: NSMenuItem!
     private var animationItem: NSMenuItem!
+    private var inputMethodEnabledItem: NSMenuItem!
+    private var diagnosticLoggingItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
     private var resizeSettingsWindowController: ResizeSettingsWindowController?
     private var inputMethodSettingsWindowController: InputMethodSettingsWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        diagnosticLog("WindowKeys: launching; macOS %@; input switching enabled=%d",
+                      ProcessInfo.processInfo.operatingSystemVersionString, InputMethodPreferences.isEnabled ? 1 : 0)
         ResizePreferences.registerDefaults()
         NSApp.setActivationPolicy(.accessory)
         createStatusMenu()
@@ -1285,9 +1394,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         hotKeys = hotKeyManager
 
-        let inputManager = InputMethodManager()
-        inputMethodManager = inputManager
-        inputManager.applyToFrontmostApplication()
+        updateInputMethodManager()
 
         UserDefaults.standard.set(AXIsProcessTrusted(), forKey: "AccessibilityTrustedAtLaunch")
 
@@ -1343,6 +1450,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         animationItem.state = AccessibilityWindowController.shared.animationEnabled ? .on : .off
         menu.addItem(animationItem)
 
+        inputMethodEnabledItem = NSMenuItem(
+            title: "自动切换输入法",
+            action: #selector(toggleInputMethodSwitching),
+            keyEquivalent: ""
+        )
+        inputMethodEnabledItem.target = self
+        inputMethodEnabledItem.state = InputMethodPreferences.isEnabled ? .on : .off
+        menu.addItem(inputMethodEnabledItem)
+
         let inputMethodSettingsItem = NSMenuItem(
             title: "应用输入法设置…",
             action: #selector(showInputMethodSettings),
@@ -1350,6 +1466,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         )
         inputMethodSettingsItem.target = self
         menu.addItem(inputMethodSettingsItem)
+
+        menu.addItem(.separator())
+        diagnosticLoggingItem = NSMenuItem(title: "保存诊断日志", action: #selector(toggleDiagnosticLogging), keyEquivalent: "")
+        diagnosticLoggingItem.target = self
+        diagnosticLoggingItem.state = DiagnosticLog.isEnabled ? .on : .off
+        menu.addItem(diagnosticLoggingItem)
+        let exportItem = NSMenuItem(title: "导出诊断日志…", action: #selector(exportDiagnosticLog), keyEquivalent: "")
+        exportItem.target = self
+        menu.addItem(exportItem)
 
         menu.addItem(.separator())
         launchAtLoginItem = NSMenuItem(
@@ -1415,6 +1540,53 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             inputMethodSettingsWindowController = controller
         }
         controller.showWindow(nil)
+    }
+
+    @objc private func toggleInputMethodSwitching() {
+        InputMethodPreferences.isEnabled.toggle()
+        inputMethodEnabledItem.state = InputMethodPreferences.isEnabled ? .on : .off
+        updateInputMethodManager()
+    }
+
+    private func updateInputMethodManager() {
+        diagnosticLog("WindowKeys: input switching enabled=%d", InputMethodPreferences.isEnabled ? 1 : 0)
+        // Do not query input sources or observe app activation while disabled.
+        inputMethodManager = nil
+        guard InputMethodPreferences.isEnabled else { return }
+        let manager = InputMethodManager()
+        inputMethodManager = manager
+        manager.applyToFrontmostApplication()
+    }
+
+    @objc private func toggleDiagnosticLogging() {
+        if DiagnosticLog.isEnabled {
+            diagnosticLog("WindowKeys: diagnostic logging disabled")
+            DiagnosticLog.isEnabled = false
+        } else {
+            DiagnosticLog.isEnabled = true
+            diagnosticLog("WindowKeys: diagnostic logging enabled; input switching=%d; accessibility=%d",
+                          InputMethodPreferences.isEnabled ? 1 : 0, AXIsProcessTrusted() ? 1 : 0)
+        }
+        diagnosticLoggingItem.state = DiagnosticLog.isEnabled ? .on : .off
+    }
+
+    @objc private func exportDiagnosticLog() {
+        let panel = NSSavePanel()
+        panel.title = "导出诊断日志"
+        panel.message = "仅保存本地文件，不会上传。可能包含应用和输入法标识，不包含输入内容或窗口标题。未开启日志时，文件只包含基本状态和已有记录。"
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "WindowKeys-diagnostics-\(Int(Date().timeIntervalSince1970)).txt"
+        panel.canCreateDirectories = true
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try DiagnosticLog.shared.export(to: url)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "无法导出诊断日志"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -1485,6 +1657,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        diagnosticLog("WindowKeys: normal termination")
         AccessibilityWindowController.shared.cancelResizeAnimation()
     }
 
