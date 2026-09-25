@@ -38,7 +38,7 @@ func runChecks() -> Int32 {
         var cleanupCount = 0
         var completionCount = 0
         do {
-            let animation = WindowResizeAnimation(applyFrame: { _ in outcome != "failed" },
+            let animation = WindowGeometryAnimation(applyFrame: { _ in outcome != "failed" },
                 completion: { completionCount += 1 }, cleanup: { cleanupCount += 1 })
             switch outcome {
             case "completed": animation.currentProgress = 1

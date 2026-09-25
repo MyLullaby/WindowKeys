@@ -381,7 +381,7 @@ private struct WindowFrame {
 
 }
 
-private final class WindowResizeAnimation: NSAnimation {
+private final class WindowGeometryAnimation: NSAnimation {
     private let applyFrame: (CGFloat) -> Bool
     private let completion: () -> Void
     private var cleanup: (() -> Void)?
@@ -432,7 +432,7 @@ private final class WindowResizeAnimation: NSAnimation {
 private final class AccessibilityWindowController {
     static let shared = AccessibilityWindowController()
 
-    private var resizeAnimation: WindowResizeAnimation?
+    private var activeAnimation: WindowGeometryAnimation?
     private var lastExternalPID: pid_t?
 
     var animationEnabled: Bool {
@@ -477,14 +477,14 @@ private final class AccessibilityWindowController {
         return AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
     }
 
-    func cancelResizeAnimation() {
-        resizeAnimation?.cancel()
-        resizeAnimation = nil
+    func cancelWindowAnimation() {
+        activeAnimation?.cancel()
+        activeAnimation = nil
     }
 
     func perform(_ command: WindowCommand) {
         diagnosticLog("WindowKeys: requested window command %u", command.rawValue)
-        cancelResizeAnimation()
+        cancelWindowAnimation()
         guard AXIsProcessTrusted() else {
             diagnosticLog("WindowKeys: accessibility permission missing")
             showAccessibilityAlert()
@@ -588,12 +588,22 @@ private final class AccessibilityWindowController {
             return false
         }
 
+        // Centering only changes the origin. Some apps (including iOA) expose
+        // AXPosition as settable while intentionally making AXSize read-only.
+        if command == .center {
+            guard isSettable(kAXPositionAttribute as CFString, on: window) else {
+                diagnosticLog("WindowKeys: center fallback unsupported (position is not settable)")
+                return false
+            }
+            let origin = CGPoint(x: workArea.midX - current.size.width / 2,
+                                 y: workArea.midY - current.size.height / 2)
+            return center(window, from: current.origin, to: origin)
+        }
+
         let target: CGRect
         switch command {
-        case .center:
-            target = CGRect(x: workArea.midX - current.size.width / 2,
-                            y: workArea.midY - current.size.height / 2,
-                            width: current.size.width, height: current.size.height)
+        case .center, .resize, .fullscreen:
+            return false
         case .maximize:
             target = workArea.insetBy(dx: tiledWindowPadding, dy: tiledWindowPadding)
         case .leftHalf, .rightHalf:
@@ -602,8 +612,6 @@ private final class AccessibilityWindowController {
             let x = command == .leftHalf ? workArea.minX + padding : workArea.midX + padding / 2
             target = CGRect(x: x, y: workArea.minY + padding,
                             width: paneWidth, height: max(1, workArea.height - padding * 2))
-        case .resize, .fullscreen:
-            return false
         }
 
         guard isSettable(kAXSizeAttribute as CFString, on: window),
@@ -620,6 +628,68 @@ private final class AccessibilityWindowController {
         let settings = UserDefaults(suiteName: "com.apple.WindowManager")
         let enabled = settings?.object(forKey: "EnableTiledWindowMargins") as? Bool ?? true
         return enabled ? CGFloat((settings?.object(forKey: "TiledWindowSpacing") as? NSNumber)?.doubleValue ?? 8) : 0
+    }
+
+    private func center(_ window: AXUIElement, from start: CGPoint, to target: CGPoint) -> Bool {
+        guard abs(start.x - target.x) > 1 || abs(start.y - target.y) > 1 else { return true }
+        guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            return setPosition(target, on: window)
+        }
+
+        var lastRequested = start
+        let animation = WindowGeometryAnimation(applyFrame: { [weak self] eased in
+            guard let self else { return false }
+            guard self.isFocused(window) else {
+                self.activeAnimation = nil
+                return false
+            }
+            let position = CGPoint(
+                x: (start.x + (target.x - start.x) * eased).rounded(),
+                y: (start.y + (target.y - start.y) * eased).rounded()
+            )
+            if position != lastRequested {
+                guard self.writePosition(position, on: window) else { return false }
+                lastRequested = position
+            }
+            return true
+        }, completion: { [weak self] in
+            self?.activeAnimation = nil
+            _ = self?.verifyPosition(target, on: window)
+        }, cleanup: {})
+        activeAnimation = animation
+        animation.start()
+        return true
+    }
+
+    @discardableResult
+    private func setPosition(_ position: CGPoint, on window: AXUIElement) -> Bool {
+        guard writePosition(position, on: window) else { return false }
+        return verifyPosition(position, on: window)
+    }
+
+    private func writePosition(_ position: CGPoint, on window: AXUIElement) -> Bool {
+        var requested = position
+        guard let value = AXValueCreate(.cgPoint, &requested) else { return false }
+        let result = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
+        if result != .success {
+            diagnosticLog("WindowKeys: setting window position failed with AX error %d", result.rawValue)
+        }
+        return result == .success
+    }
+
+    private func verifyPosition(_ position: CGPoint, on window: AXUIElement) -> Bool {
+        guard let actual = readFrame(of: window) else {
+            diagnosticLog("WindowKeys: center fallback could not verify resulting window position")
+            return false
+        }
+        let matches = abs(actual.origin.x - position.x) <= 2 && abs(actual.origin.y - position.y) <= 2
+        if matches {
+            diagnosticLog("WindowKeys: center fallback applied using position only")
+        } else {
+            diagnosticLog("WindowKeys: center fallback position constrained (requested %.0f,%.0f; got %.0f,%.0f)",
+                          position.x, position.y, actual.origin.x, actual.origin.y)
+        }
+        return matches
     }
 
     @discardableResult
@@ -825,10 +895,10 @@ private final class AccessibilityWindowController {
         }
 
         var lastRequested = start
-        let animation = WindowResizeAnimation(applyFrame: { [weak self] eased in
+        let animation = WindowGeometryAnimation(applyFrame: { [weak self] eased in
             guard let self else { return false }
             guard self.isFocused(window) else {
-                self.resizeAnimation = nil
+                self.activeAnimation = nil
                 return false
             }
             let size = CGSize(
@@ -841,9 +911,9 @@ private final class AccessibilityWindowController {
             }
             return true
         }, completion: { [weak self] in
-            self?.resizeAnimation = nil
+            self?.activeAnimation = nil
         }, cleanup: restoreEnhancedUI)
-        resizeAnimation = animation
+        activeAnimation = animation
         animation.start()
     }
 
@@ -1537,7 +1607,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(sizeSettingsItem)
 
         animationItem = NSMenuItem(
-            title: "调整大小动画",
+            title: "窗口调整动画",
             action: #selector(toggleAnimation(_:)),
             keyEquivalent: ""
         )
@@ -1766,7 +1836,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func applicationWillTerminate(_ notification: Notification) {
         diagnosticLog("WindowKeys: normal termination")
-        AccessibilityWindowController.shared.cancelResizeAnimation()
+        AccessibilityWindowController.shared.cancelWindowAnimation()
     }
 
     @objc private func quit() {
