@@ -9,7 +9,10 @@ private func checkTranslationPayload() throws {
     assert(body["stream"] as? Bool == false)
     assert(body["tools"] == nil)
     let messages = body["messages"] as! [[String: String]]
-    assert(messages.last?["content"] == "Hello\n\"world\"")
+    // 代理会覆盖 system 消息，因此只能发送一条 user 消息，且必须带上待翻译原文。
+    assert(messages.count == 1)
+    assert(messages[0]["role"] == "user")
+    assert(messages[0]["content"]?.contains("Hello\n\"world\"") == true)
     let models = try TranslationPayload.models(from: Data(#"{"data":[{"id":"b"},{"id":"a"},{"id":"b"},{"id":""}]}"#.utf8))
     assert(models == ["a", "b"])
     let translated = try TranslationPayload.translation(from: Data(#"{"choices":[{"message":{"content":" 你好 "}}]}"#.utf8))
