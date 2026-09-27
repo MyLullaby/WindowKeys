@@ -51,6 +51,78 @@ enum TranslationPayload {
     }
 }
 
+// Read the selection from AX only. WebKit exposes text-marker ranges instead of
+// AXSelectedText for static page content; no clipboard or synthetic keys needed.
+enum TranslationSelectionReader {
+    private static func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
+        var value: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, name, &value) == .success ? value : nil
+    }
+
+    private static func element(_ value: CFTypeRef?) -> AXUIElement? {
+        guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    private static func selection(of element: AXUIElement) -> String? {
+        if let text = attribute(element, kAXSelectedTextAttribute as CFString) as? String,
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return text }
+        guard let range = attribute(element, "AXSelectedTextMarkerRange" as CFString) else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(element, "AXStringForTextMarkerRange" as CFString,
+                                                          range, &value) == .success,
+              let text = value as? String,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return text
+    }
+
+    private static func selectionInHierarchy(startingAt start: AXUIElement) -> String? {
+        var current: AXUIElement? = start
+        for _ in 0..<8 {
+            guard let candidate = current else { break }
+            if let text = selection(of: candidate) { return text }
+            current = element(attribute(candidate, kAXParentAttribute as CFString))
+        }
+        return nil
+    }
+
+    static func read(from app: NSRunningApplication) -> String? {
+        guard AXIsProcessTrusted() else { return nil }
+        let application = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(application, 0.5)
+        let focused = element(attribute(application, kAXFocusedUIElementAttribute as CFString))
+        if let focused, let text = selectionInHierarchy(startingAt: focused) { return text }
+
+        // The highlighted text may not own keyboard focus (e.g. a message
+        // bubble). Inspect the element beneath the selection-end pointer, but
+        // only inside the target application's focused window.
+        guard let focusedWindow = element(attribute(application, kAXFocusedWindowAttribute as CFString))
+        else { return nil }
+        if let pointer = CGEvent(source: nil)?.location {
+            var hit: AXUIElement?
+            if AXUIElementCopyElementAtPosition(application, Float(pointer.x), Float(pointer.y), &hit) == .success,
+               let hit,
+               element(attribute(hit, kAXWindowAttribute as CFString)).map({ CFEqual($0, focusedWindow) }) == true,
+               let text = selectionInHierarchy(startingAt: hit) { return text }
+        }
+        // Some applications expose a selected web page but no focused element.
+        // Only search web areas in that case; never harvest unrelated text fields.
+        guard focused == nil else { return nil }
+        var pending = [focusedWindow]
+        var visited = 0
+        while !pending.isEmpty && visited < 80 {
+            let candidate = pending.removeFirst()
+            visited += 1
+            if attribute(candidate, kAXRoleAttribute as CFString) as? String == "AXWebArea",
+               let text = selection(of: candidate) { return text }
+            if let children = attribute(candidate, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+                pending.append(contentsOf: children.prefix(80 - visited))
+            }
+        }
+        return nil
+    }
+}
+
 final class TranslationWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
     private let sourceView = NSTextView()
     private let resultView = NSTextView()
@@ -82,24 +154,13 @@ final class TranslationWindowController: NSWindowController, NSWindowDelegate, N
 
     deinit { session.invalidateAndCancel() }
 
-    // Read selection before activating our panel. Never synthesize Copy or alter
-    // the user's clipboard; unsupported apps can paste into the editable source.
+    // Read the original app's selection before our panel takes focus.
     func showSelection(from app: NSRunningApplication?) {
         cancelTranslation()
-        var text: String?
-        if AXIsProcessTrusted(), let app {
-            let element = AXUIElementCreateApplication(app.processIdentifier)
-            AXUIElementSetMessagingTimeout(element, 0.5)
-            var focused: CFTypeRef?
-            if AXUIElementCopyAttributeValue(element, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-               let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() {
-                let focusedElement = focused as! AXUIElement
-                var value: CFTypeRef?
-                if AXUIElementCopyAttributeValue(focusedElement, kAXSelectedTextAttribute as CFString, &value) == .success {
-                    text = value as? String
-                }
-            }
-        }
+        present(app.flatMap { TranslationSelectionReader.read(from: $0) })
+    }
+
+    private func present(_ text: String?) {
         sourceView.string = text ?? ""
         resultView.string = ""
         showWindow(nil)
