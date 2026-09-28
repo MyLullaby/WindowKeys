@@ -619,8 +619,24 @@ private final class AccessibilityWindowController {
             diagnosticLog("WindowKeys: custom geometry fallback unsupported for command %u (position/size not settable)", command.rawValue)
             return false
         }
-        guard setFrame(target, on: window) else { return false }
-        diagnosticLog("WindowKeys: custom geometry fallback applied for command %u", command.rawValue)
+        guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            return setFrame(target, on: window)
+        }
+        let start = current.rect
+        let animation = WindowGeometryAnimation(applyFrame: { [weak self] eased in
+            guard let self, self.isFocused(window) else { return false }
+            let frame = CGRect(
+                x: (start.minX + (target.minX - start.minX) * eased).rounded(),
+                y: (start.minY + (target.minY - start.minY) * eased).rounded(),
+                width: (start.width + (target.width - start.width) * eased).rounded(),
+                height: (start.height + (target.height - start.height) * eased).rounded()
+            )
+            return self.setFrame(frame, on: window)
+        }, completion: {
+            diagnosticLog("WindowKeys: custom geometry fallback applied for command %u", command.rawValue)
+        }, cleanup: { [weak self] in self?.activeAnimation = nil })
+        activeAnimation = animation
+        animation.start()
         return true
     }
 

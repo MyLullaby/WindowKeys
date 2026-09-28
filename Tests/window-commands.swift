@@ -53,8 +53,9 @@ func runChecks() -> Int32 {
     print("PASS shortcut mapping and animation state cleanup")
     if CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--geometry-only" { return 0 }
 
-    guard CommandLine.arguments.count == 3, AXIsProcessTrusted() else {
-        print("Usage: run-window-commands.sh <bundle-id> <window-title>; Accessibility permission required")
+    let fillAnimationOnly = CommandLine.arguments.count == 4 && CommandLine.arguments[3] == "--fill-animation"
+    guard (CommandLine.arguments.count == 3 || fillAnimationOnly), AXIsProcessTrusted() else {
+        print("Usage: run-window-commands.sh <bundle-id> <window-title> [--fill-animation]; Accessibility permission required")
         return 2
     }
     let app = NSApplication.shared
@@ -153,9 +154,20 @@ func runChecks() -> Int32 {
         wait(0.12)
         check("completed resize stays still", resized)
     }
+    let beforeFill = frame(window)
     guard perform(.maximize) else { return 3 }
+    if fillAnimationOnly && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        check("fallback fill starts at the original frame", beforeFill)
+        wait(0.08)
+        let intermediate = frame(window)
+        let changed = abs(intermediate.width - beforeFill.width) > 2 || abs(intermediate.height - beforeFill.height) > 2
+        let finished = abs(intermediate.width - filled.width) <= 2 && abs(intermediate.height - filled.height) <= 2
+        print("\(changed && !finished ? "PASS" : "FAIL") fallback fill has an intermediate frame: \(intermediate)")
+        if !changed || finished { failures += 1 }
+    }
     wait(1)
-    check("native maximize", filled, tolerance: 16)
+    check("fill", filled, tolerance: 16)
+    if fillAnimationOnly { return failures == 0 ? 0 : 1 }
     guard perform(.resize) else { return 3 }
     wait(1)
     let afterTiling = frame(window)
@@ -174,7 +186,7 @@ func runChecks() -> Int32 {
     wait(0.04)
     guard perform(.maximize) else { return 3 }
     wait(1)
-    check("native maximize cancels custom resize animation", filled, tolerance: 16)
+    check("fill cancels custom resize animation", filled, tolerance: 16)
     let enhancedAfter = attribute(appElement, "AXEnhancedUserInterface") as? Bool
     if enhancedBefore != enhancedAfter { print("FAIL enhanced accessibility state changed"); failures += 1 }
     return failures == 0 ? 0 : 1
