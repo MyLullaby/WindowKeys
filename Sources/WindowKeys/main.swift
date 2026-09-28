@@ -699,7 +699,13 @@ private final class AccessibilityWindowController {
         guard let sizeValue = AXValueCreate(.cgSize, &size),
               let positionValue = AXValueCreate(.cgPoint, &position) else { return false }
 
-        // Resize first, then place: some apps reposition windows when their size changes.
+        // Move before resizing so apps that constrain size to the current screen edge can fill it.
+        // Move again because some apps reposition windows when their size changes.
+        let initialPositionResult = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
+        guard initialPositionResult == .success else {
+            diagnosticLog("WindowKeys: fallback setting window position failed with AX error %d", initialPositionResult.rawValue)
+            return false
+        }
         let sizeResult = AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
         guard sizeResult == .success else {
             diagnosticLog("WindowKeys: fallback setting window size failed with AX error %d", sizeResult.rawValue)
