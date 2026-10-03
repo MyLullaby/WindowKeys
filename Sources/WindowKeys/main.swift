@@ -434,6 +434,18 @@ private final class AccessibilityWindowController {
 
     private var activeAnimation: WindowGeometryAnimation?
     private var lastExternalPID: pid_t?
+    private struct NativeMenuKey: Hashable {
+        let pid: pid_t
+        let launchDate: Date?
+        let identifier: String
+    }
+    private enum NativeMenuResult {
+        case missing
+        case available(AXUIElement)
+    }
+    private var nativeMenuCache: [NativeMenuKey: NativeMenuResult] = [:]
+    private var nativeMenuRefreshes: Set<NativeMenuKey> = []
+    private let nativeMenuQueue = DispatchQueue(label: "com.bland.windowkeys.menu-refresh", qos: .utility)
 
     var animationEnabled: Bool {
         get {
@@ -766,22 +778,13 @@ private final class AccessibilityWindowController {
     }
 
     private func performNativeWindowCommand(identifier: String, on application: AXUIElement) -> Bool {
-        var menuBarValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            application,
-            kAXMenuBarAttribute as CFString,
-            &menuBarValue
-        ) == .success,
-        let menuBarValue else {
-            diagnosticLog("WindowKeys: native command %@ has no accessible menu bar", identifier)
-            return false
-        }
-
-        let menuBar = menuBarValue as! AXUIElement
-        guard let item = findElement(identifier: identifier, under: menuBar, depth: 0) else {
-            diagnosticLog("WindowKeys: native command %@ was not found", identifier)
-            return false
-        }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(application, &pid) == .success else { return false }
+        let key = NativeMenuKey(pid: pid,
+            launchDate: NSRunningApplication(processIdentifier: pid)?.launchDate, identifier: identifier)
+        let cached = nativeMenuCache[key]
+        refreshNativeMenu(key)
+        guard case let .available(item)? = cached else { return false }
 
         var enabled: CFTypeRef?
         guard AXUIElementCopyAttributeValue(item, kAXEnabledAttribute as CFString, &enabled) == .success,
@@ -799,32 +802,54 @@ private final class AccessibilityWindowController {
         return false
     }
 
-    private func findElement(identifier: String, under element: AXUIElement, depth: Int) -> AXUIElement? {
-        guard depth <= 8 else { return nil }
-
-        var identifierValue: CFTypeRef?
-        if AXUIElementCopyAttributeValue(
-            element,
-            kAXIdentifierAttribute as CFString,
-            &identifierValue
-        ) == .success,
-        let currentIdentifier = identifierValue as? String,
-        currentIdentifier == identifier {
-            return element
+    private func refreshNativeMenu(_ key: NativeMenuKey) {
+        // Cache and in-flight state belong to the main thread. Workers only read AX
+        // menus; they never press commands or change the current window operation.
+        guard nativeMenuRefreshes.insert(key).inserted else { return }
+        nativeMenuQueue.async { [weak self] in
+            let application = AXUIElementCreateApplication(key.pid)
+            AXUIElementSetMessagingTimeout(application, 1)
+            var value: CFTypeRef?
+            let result: NativeMenuResult?
+            if AXUIElementCopyAttributeValue(application, kAXMenuBarAttribute as CFString, &value) == .success,
+               let value {
+                var complete = true
+                let item = Self.findElement(identifier: key.identifier,
+                    under: value as! AXUIElement, depth: 0, complete: &complete)
+                result = item.map { .available($0) } ?? (complete ? .missing : nil)
+            } else {
+                // A transient AX failure must not erase a previously useful entry.
+                result = nil
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.nativeMenuRefreshes.remove(key)
+                guard let app = NSRunningApplication(processIdentifier: key.pid),
+                      !app.isTerminated, app.launchDate == key.launchDate else {
+                    self.nativeMenuCache.removeValue(forKey: key)
+                    return
+                }
+                if let result { self.nativeMenuCache[key] = result }
+            }
         }
+    }
+
+    private static func findElement(identifier: String, under element: AXUIElement, depth: Int,
+                                    complete: inout Bool) -> AXUIElement? {
+        guard depth <= 8 else { complete = false; return nil }
+        var identifierValue: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXIdentifierAttribute as CFString,
+                                         &identifierValue) == .success,
+           identifierValue as? String == identifier { return element }
 
         var childrenValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXChildrenAttribute as CFString,
-            &childrenValue
-        ) == .success,
-        let children = childrenValue as? [AXUIElement] else { return nil }
-
+        let error = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenValue)
+        if error == .attributeUnsupported || error == .noValue { return nil }
+        guard error == .success else { complete = false; return nil }
+        guard let children = childrenValue as? [AXUIElement] else { return nil }
         for child in children {
-            if let match = findElement(identifier: identifier, under: child, depth: depth + 1) {
-                return match
-            }
+            if let match = findElement(identifier: identifier, under: child, depth: depth + 1,
+                                       complete: &complete) { return match }
         }
         return nil
     }
