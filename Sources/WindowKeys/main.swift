@@ -1449,13 +1449,11 @@ private final class InputMethodSettingsWindowController: NSWindowController, NST
 
 private final class GlobalHotKeyManager {
     private static let signature: OSType = 0x574B4559 // WKEY
-    private static let translationID: UInt32 = 100
     private var eventHandler: EventHandlerRef?
     private var registrations: [UInt32: EventHotKeyRef] = [:]
     private var pressed: Set<UInt32> = []
     private(set) var registrationFailures: [String] = []
     var onCommand: ((WindowCommand) -> Void)?
-    var onTranslate: (() -> Void)?
 
     init() {
         let events = [
@@ -1485,15 +1483,6 @@ private final class GlobalHotKeyManager {
                 diagnosticLog("WindowKeys: failed to register hotkey %@: %d", command.title, result)
             }
         }
-        var translationRef: EventHotKeyRef?
-        let translationIdentifier = EventHotKeyID(signature: Self.signature, id: Self.translationID)
-        let translationStatus = RegisterEventHotKey(UInt32(kVK_ANSI_D), UInt32(optionKey),
-            translationIdentifier, GetApplicationEventTarget(), 0, &translationRef)
-        if translationStatus == noErr, let translationRef {
-            registrations[Self.translationID] = translationRef
-        } else {
-            registrationFailures.append("选词翻译 Option-D（错误码 \(translationStatus)）")
-        }
     }
 
     deinit {
@@ -1514,10 +1503,6 @@ private final class GlobalHotKeyManager {
         guard GetEventKind(event) == UInt32(kEventHotKeyPressed) else { return OSStatus(eventNotHandledErr) }
         guard pressed.insert(identifier.id).inserted else { return noErr }
 
-        if identifier.id == Self.translationID {
-            DispatchQueue.main.async { [weak self] in self?.onTranslate?() }
-            return noErr
-        }
         guard let command = WindowCommand(rawValue: identifier.id) else { return OSStatus(eventNotHandledErr) }
 
         UserDefaults.standard.set(Int(command.rawValue), forKey: "LastHotKeyCommand")
@@ -1542,7 +1527,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var launchAtLoginItem: NSMenuItem!
     private var resizeSettingsWindowController: ResizeSettingsWindowController?
     private var inputMethodSettingsWindowController: InputMethodSettingsWindowController?
-    private var translationWindowController: TranslationWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         diagnosticLog("WindowKeys: launching; macOS %@; input switching enabled=%d",
@@ -1556,7 +1540,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         hotKeyManager.onCommand = { command in
             AccessibilityWindowController.shared.perform(command)
         }
-        hotKeyManager.onTranslate = { [weak self] in self?.showTranslation() }
         hotKeys = hotKeyManager
 
         updateInputMethodManager()
@@ -1632,11 +1615,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         inputMethodSettingsItem.target = self
         menu.addItem(inputMethodSettingsItem)
 
-        let translationItem = NSMenuItem(title: "选词翻译…", action: #selector(showTranslation), keyEquivalent: "d")
-        translationItem.keyEquivalentModifierMask = [.option]
-        translationItem.target = self
-        menu.addItem(translationItem)
-
         menu.addItem(.separator())
         diagnosticLoggingItem = NSMenuItem(title: "保存诊断日志", action: #selector(toggleDiagnosticLogging), keyEquivalent: "")
         diagnosticLoggingItem.target = self
@@ -1670,14 +1648,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func runMenuCommand(_ sender: NSMenuItem) {
         guard let command = WindowCommand(rawValue: UInt32(sender.tag)) else { return }
         AccessibilityWindowController.shared.perform(command)
-    }
-
-    @objc private func showTranslation() {
-        let app = AccessibilityWindowController.shared.currentExternalApplication()
-        if translationWindowController == nil {
-            translationWindowController = TranslationWindowController()
-        }
-        translationWindowController?.showSelection(from: app)
     }
 
     @objc private func showResizeSettings() {
