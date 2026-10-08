@@ -381,59 +381,26 @@ private struct WindowFrame {
 
 }
 
-private final class WindowGeometryAnimation: NSAnimation {
-    private let applyFrame: (CGFloat) -> Bool
-    private let completion: () -> Void
-    private var cleanup: (() -> Void)?
-    private var finished = false
-
-    init(applyFrame: @escaping (CGFloat) -> Bool, completion: @escaping () -> Void,
-         cleanup: @escaping () -> Void) {
-        self.applyFrame = applyFrame
-        self.completion = completion
-        self.cleanup = cleanup
-        super.init(duration: 0.3, animationCurve: .easeOut)
-        animationBlockingMode = .nonblocking
-        frameRate = Float(NSScreen.main?.maximumFramesPerSecond ?? 60)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-    deinit { cleanup?() }
-
-    private func restoreState() {
-        let action = cleanup
-        cleanup = nil
-        action?()
-    }
-
-    func cancel() {
-        guard !finished else { return }
-        finished = true
-        super.stop()
-        restoreState()
-    }
-
-    override var currentProgress: NSAnimation.Progress {
-        didSet {
-            guard !finished else { return }
-            let eased = 1 - pow(1 - CGFloat(currentValue), 3)
-            guard applyFrame(eased) else { cancel(); return }
-            if currentProgress >= 1 {
-                finished = true
-                super.stop()
-                defer { restoreState() }
-                completion()
-            }
-        }
-    }
-}
-
 private final class AccessibilityWindowController {
     static let shared = AccessibilityWindowController()
 
     private var activeAnimation: WindowGeometryAnimation?
     private var lastExternalPID: pid_t?
+    var onGeometryCommandStarted: ((AXUIElement) -> Void)?
+    var onGeometryCommandCompleted: ((AXUIElement) -> Void)?
+    private var pendingNativeRecord: DispatchWorkItem?
+    private struct NativeMenuKey: Hashable {
+        let pid: pid_t
+        let launchDate: Date?
+        let identifier: String
+    }
+    private enum NativeMenuResult {
+        case missing
+        case available(AXUIElement)
+    }
+    private var nativeMenuCache: [NativeMenuKey: NativeMenuResult] = [:]
+    private var nativeMenuRefreshes: Set<NativeMenuKey> = []
+    private let nativeMenuQueue = DispatchQueue(label: "com.bland.windowkeys.menu-refresh", qos: .utility)
 
     var animationEnabled: Bool {
         get {
@@ -483,6 +450,7 @@ private final class AccessibilityWindowController {
     }
 
     func perform(_ command: WindowCommand) {
+        pendingNativeRecord?.cancel()
         diagnosticLog("WindowKeys: requested window command %u", command.rawValue)
         cancelWindowAnimation()
         guard AXIsProcessTrusted() else {
@@ -505,11 +473,18 @@ private final class AccessibilityWindowController {
             toggleFullscreen(in: application)
             return
         }
+        if let window = focusedWindow(in: application) { onGeometryCommandStarted?(window) }
 
         // Prefer native tiling to preserve system animation/tiling state. If the
         // menu action is unavailable or fails, the fallback below uses AX geometry.
         if let identifier = command.nativeMenuIdentifier {
-            if !performNativeWindowCommand(identifier: identifier, on: application) {
+            if performNativeWindowCommand(identifier: identifier, on: application) {
+                if let window = focusedWindow(in: application) {
+                    let task = DispatchWorkItem { [weak self] in self?.onGeometryCommandCompleted?(window) }
+                    pendingNativeRecord = task
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: task)
+                }
+            } else {
                 // Some apps do not expose the system's tiling menu through Accessibility.
                 // Fall back to public AX position/size setters when the window supports them.
                 if !performCustomGeometryCommand(command, in: application) {
@@ -619,8 +594,27 @@ private final class AccessibilityWindowController {
             diagnosticLog("WindowKeys: custom geometry fallback unsupported for command %u (position/size not settable)", command.rawValue)
             return false
         }
-        guard setFrame(target, on: window) else { return false }
-        diagnosticLog("WindowKeys: custom geometry fallback applied for command %u", command.rawValue)
+        guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            let success = setFrame(target, on: window)
+            if success { onGeometryCommandCompleted?(window) }
+            return success
+        }
+        let start = current.rect
+        let animation = WindowGeometryAnimation(applyFrame: { [weak self] eased in
+            guard let self, self.isFocused(window) else { return false }
+            let frame = CGRect(
+                x: (start.minX + (target.minX - start.minX) * eased).rounded(),
+                y: (start.minY + (target.minY - start.minY) * eased).rounded(),
+                width: (start.width + (target.width - start.width) * eased).rounded(),
+                height: (start.height + (target.height - start.height) * eased).rounded()
+            )
+            return self.setFrame(frame, on: window)
+        }, completion: { [weak self] in
+            diagnosticLog("WindowKeys: custom geometry fallback applied for command %u", command.rawValue)
+            self?.onGeometryCommandCompleted?(window)
+        }, cleanup: { [weak self] in self?.activeAnimation = nil })
+        activeAnimation = animation
+        animation.start()
         return true
     }
 
@@ -631,9 +625,14 @@ private final class AccessibilityWindowController {
     }
 
     private func center(_ window: AXUIElement, from start: CGPoint, to target: CGPoint) -> Bool {
-        guard abs(start.x - target.x) > 1 || abs(start.y - target.y) > 1 else { return true }
+        guard abs(start.x - target.x) > 1 || abs(start.y - target.y) > 1 else {
+            onGeometryCommandCompleted?(window)
+            return true
+        }
         guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
-            return setPosition(target, on: window)
+            let success = setPosition(target, on: window)
+            if success { onGeometryCommandCompleted?(window) }
+            return success
         }
 
         var lastRequested = start
@@ -654,7 +653,7 @@ private final class AccessibilityWindowController {
             return true
         }, completion: { [weak self] in
             self?.activeAnimation = nil
-            _ = self?.verifyPosition(target, on: window)
+            if self?.verifyPosition(target, on: window) == true { self?.onGeometryCommandCompleted?(window) }
         }, cleanup: {})
         activeAnimation = animation
         animation.start()
@@ -699,7 +698,13 @@ private final class AccessibilityWindowController {
         guard let sizeValue = AXValueCreate(.cgSize, &size),
               let positionValue = AXValueCreate(.cgPoint, &position) else { return false }
 
-        // Resize first, then place: some apps reposition windows when their size changes.
+        // Move before resizing so apps that constrain size to the current screen edge can fill it.
+        // Move again because some apps reposition windows when their size changes.
+        let initialPositionResult = AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
+        guard initialPositionResult == .success else {
+            diagnosticLog("WindowKeys: fallback setting window position failed with AX error %d", initialPositionResult.rawValue)
+            return false
+        }
         let sizeResult = AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
         guard sizeResult == .success else {
             diagnosticLog("WindowKeys: fallback setting window size failed with AX error %d", sizeResult.rawValue)
@@ -744,22 +749,13 @@ private final class AccessibilityWindowController {
     }
 
     private func performNativeWindowCommand(identifier: String, on application: AXUIElement) -> Bool {
-        var menuBarValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            application,
-            kAXMenuBarAttribute as CFString,
-            &menuBarValue
-        ) == .success,
-        let menuBarValue else {
-            diagnosticLog("WindowKeys: native command %@ has no accessible menu bar", identifier)
-            return false
-        }
-
-        let menuBar = menuBarValue as! AXUIElement
-        guard let item = findElement(identifier: identifier, under: menuBar, depth: 0) else {
-            diagnosticLog("WindowKeys: native command %@ was not found", identifier)
-            return false
-        }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(application, &pid) == .success else { return false }
+        let key = NativeMenuKey(pid: pid,
+            launchDate: NSRunningApplication(processIdentifier: pid)?.launchDate, identifier: identifier)
+        let cached = nativeMenuCache[key]
+        refreshNativeMenu(key)
+        guard case let .available(item)? = cached else { return false }
 
         var enabled: CFTypeRef?
         guard AXUIElementCopyAttributeValue(item, kAXEnabledAttribute as CFString, &enabled) == .success,
@@ -777,32 +773,54 @@ private final class AccessibilityWindowController {
         return false
     }
 
-    private func findElement(identifier: String, under element: AXUIElement, depth: Int) -> AXUIElement? {
-        guard depth <= 8 else { return nil }
-
-        var identifierValue: CFTypeRef?
-        if AXUIElementCopyAttributeValue(
-            element,
-            kAXIdentifierAttribute as CFString,
-            &identifierValue
-        ) == .success,
-        let currentIdentifier = identifierValue as? String,
-        currentIdentifier == identifier {
-            return element
+    private func refreshNativeMenu(_ key: NativeMenuKey) {
+        // Cache and in-flight state belong to the main thread. Workers only read AX
+        // menus; they never press commands or change the current window operation.
+        guard nativeMenuRefreshes.insert(key).inserted else { return }
+        nativeMenuQueue.async { [weak self] in
+            let application = AXUIElementCreateApplication(key.pid)
+            AXUIElementSetMessagingTimeout(application, 1)
+            var value: CFTypeRef?
+            let result: NativeMenuResult?
+            if AXUIElementCopyAttributeValue(application, kAXMenuBarAttribute as CFString, &value) == .success,
+               let value {
+                var complete = true
+                let item = Self.findElement(identifier: key.identifier,
+                    under: value as! AXUIElement, depth: 0, complete: &complete)
+                result = item.map { .available($0) } ?? (complete ? .missing : nil)
+            } else {
+                // A transient AX failure must not erase a previously useful entry.
+                result = nil
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.nativeMenuRefreshes.remove(key)
+                guard let app = NSRunningApplication(processIdentifier: key.pid),
+                      !app.isTerminated, app.launchDate == key.launchDate else {
+                    self.nativeMenuCache.removeValue(forKey: key)
+                    return
+                }
+                if let result { self.nativeMenuCache[key] = result }
+            }
         }
+    }
+
+    private static func findElement(identifier: String, under element: AXUIElement, depth: Int,
+                                    complete: inout Bool) -> AXUIElement? {
+        guard depth <= 8 else { complete = false; return nil }
+        var identifierValue: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXIdentifierAttribute as CFString,
+                                         &identifierValue) == .success,
+           identifierValue as? String == identifier { return element }
 
         var childrenValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXChildrenAttribute as CFString,
-            &childrenValue
-        ) == .success,
-        let children = childrenValue as? [AXUIElement] else { return nil }
-
+        let error = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenValue)
+        if error == .attributeUnsupported || error == .noValue { return nil }
+        guard error == .success else { complete = false; return nil }
+        guard let children = childrenValue as? [AXUIElement] else { return nil }
         for child in children {
-            if let match = findElement(identifier: identifier, under: child, depth: depth + 1) {
-                return match
-            }
+            if let match = findElement(identifier: identifier, under: child, depth: depth + 1,
+                                       complete: &complete) { return match }
         }
         return nil
     }
@@ -868,7 +886,10 @@ private final class AccessibilityWindowController {
         from start: CGSize,
         to target: CGSize
     ) {
-        guard abs(start.width - target.width) > 1 || abs(start.height - target.height) > 1 else { return }
+        guard abs(start.width - target.width) > 1 || abs(start.height - target.height) > 1 else {
+            onGeometryCommandCompleted?(window)
+            return
+        }
 
         var enhancedValue: CFTypeRef?
         let enhancedAttribute = "AXEnhancedUserInterface" as CFString
@@ -890,7 +911,7 @@ private final class AccessibilityWindowController {
         }
         guard animationEnabled && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
             defer { restoreEnhancedUI() }
-            setSize(target, on: window)
+            if setSize(target, on: window) { onGeometryCommandCompleted?(window) }
             return
         }
 
@@ -906,12 +927,13 @@ private final class AccessibilityWindowController {
                 height: (start.height + (target.height - start.height) * eased).rounded()
             )
             if size != lastRequested {
-                self.setSize(size, on: window)
+                guard self.setSize(size, on: window) else { return false }
                 lastRequested = size
             }
             return true
         }, completion: { [weak self] in
             self?.activeAnimation = nil
+            self?.onGeometryCommandCompleted?(window)
         }, cleanup: restoreEnhancedUI)
         activeAnimation = animation
         animation.start()
@@ -925,14 +947,17 @@ private final class AccessibilityWindowController {
         return CFEqual(focused, window)
     }
 
-    private func setSize(_ size: CGSize, on window: AXUIElement) {
+    @discardableResult
+    private func setSize(_ size: CGSize, on window: AXUIElement) -> Bool {
         var value = size
         if let axValue = AXValueCreate(.cgSize, &value) {
             let result = AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, axValue)
             if result != .success {
                 diagnosticLog("WindowKeys: setting window size failed with AX error %d", result.rawValue)
             }
+            return result == .success
         }
+        return false
     }
 
     private func showAccessibilityAlert() {
@@ -1517,6 +1542,8 @@ private final class GlobalHotKeyManager {
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private var windowLayoutMemory: WindowLayoutMemory?
+    private var windowLayoutMemoryItem: NSMenuItem!
     private var hotKeys: GlobalHotKeyManager?
     private var inputMethodManager: InputMethodManager?
     private var statusItem: NSStatusItem!
@@ -1547,6 +1574,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         UserDefaults.standard.set(AXIsProcessTrusted(), forKey: "AccessibilityTrustedAtLaunch")
 
         _ = AccessibilityWindowController.shared.requestAccessibilityIfNeeded()
+        updateWindowLayoutMemory()
         if !hotKeyManager.registrationFailures.isEmpty {
             let alert = NSAlert()
             alert.messageText = "部分窗口快捷键注册失败"
@@ -1597,6 +1625,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         animationItem.target = self
         animationItem.state = AccessibilityWindowController.shared.animationEnabled ? .on : .off
         menu.addItem(animationItem)
+
+        windowLayoutMemoryItem = NSMenuItem(title: "记住应用窗口大小和位置",
+            action: #selector(toggleWindowLayoutMemory), keyEquivalent: "")
+        windowLayoutMemoryItem.target = self
+        windowLayoutMemoryItem.state = WindowLayoutMemory.isEnabled ? .on : .off
+        menu.addItem(windowLayoutMemoryItem)
 
         inputMethodEnabledItem = NSMenuItem(
             title: "自动切换输入法",
@@ -1674,6 +1708,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let controller = AccessibilityWindowController.shared
         controller.animationEnabled.toggle()
         sender.state = controller.animationEnabled ? .on : .off
+    }
+
+    @objc private func toggleWindowLayoutMemory() {
+        WindowLayoutMemory.isEnabled.toggle()
+        windowLayoutMemoryItem.state = WindowLayoutMemory.isEnabled ? .on : .off
+        updateWindowLayoutMemory()
+    }
+
+    private func updateWindowLayoutMemory() {
+        let controller = AccessibilityWindowController.shared
+        controller.onGeometryCommandStarted = nil
+        controller.onGeometryCommandCompleted = nil
+        windowLayoutMemory?.stop()
+        windowLayoutMemory = nil
+        guard WindowLayoutMemory.isEnabled else { return }
+        let manager = WindowLayoutMemory()
+        windowLayoutMemory = manager
+        controller.onGeometryCommandStarted = { [weak manager] in manager?.prepareForCommand(on: $0) }
+        controller.onGeometryCommandCompleted = { [weak manager] in manager?.recordCommandResult(on: $0) }
+        manager.start()
     }
 
     @objc private func showInputMethodSettings() {
@@ -1805,6 +1859,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        windowLayoutMemory?.stop()
         diagnosticLog("WindowKeys: normal termination")
         AccessibilityWindowController.shared.cancelWindowAnimation()
     }
