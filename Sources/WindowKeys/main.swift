@@ -1554,6 +1554,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var launchAtLoginItem: NSMenuItem!
     private var resizeSettingsWindowController: ResizeSettingsWindowController?
     private var inputMethodSettingsWindowController: InputMethodSettingsWindowController?
+    private var displayControlWindowController: DisplayControlWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         diagnosticLog("WindowKeys: launching; macOS %@; input switching enabled=%d",
@@ -1649,6 +1650,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         inputMethodSettingsItem.target = self
         menu.addItem(inputMethodSettingsItem)
 
+        let displayItem = NSMenuItem(title: "外接显示器…", action: #selector(showDisplayControl), keyEquivalent: "")
+        displayItem.target = self
+        menu.addItem(displayItem)
+
         menu.addItem(.separator())
         diagnosticLoggingItem = NSMenuItem(title: "保存诊断日志", action: #selector(toggleDiagnosticLogging), keyEquivalent: "")
         diagnosticLoggingItem.target = self
@@ -1682,6 +1687,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     @objc private func runMenuCommand(_ sender: NSMenuItem) {
         guard let command = WindowCommand(rawValue: UInt32(sender.tag)) else { return }
         AccessibilityWindowController.shared.perform(command)
+    }
+
+    @objc private func showDisplayControl() {
+        if displayControlWindowController == nil {
+            displayControlWindowController = DisplayControlWindowController()
+        }
+        displayControlWindowController?.showWindow(nil)
     }
 
     @objc private func showResizeSettings() {
