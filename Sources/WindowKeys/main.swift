@@ -1542,6 +1542,12 @@ private final class GlobalHotKeyManager {
 }
 
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let powerAwake = PowerAwakeController()
+    private var powerAwakeMenu: NSMenu!
+    private var powerAwakeStatusItem: NSMenuItem!
+    private var powerAwakeSleepItem: NSMenuItem!
+    private var powerAwakeEnableItem: NSMenuItem!
+    private var powerAwakeDisableItem: NSMenuItem!
     private var windowLayoutMemory: WindowLayoutMemory?
     private var windowLayoutMemoryItem: NSMenuItem!
     private var hotKeys: GlobalHotKeyManager?
@@ -1562,6 +1568,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         ResizePreferences.registerDefaults()
         NSApp.setActivationPolicy(.accessory)
         createStatusMenu()
+        powerAwake.onChange = { [weak self] in self?.updatePowerAwakeMenu() }
+        powerAwake.refresh()
 
         // Register only after NSApplication has a live application event target.
         let hotKeyManager = GlobalHotKeyManager()
@@ -1655,6 +1663,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(displayItem)
 
         menu.addItem(.separator())
+        let powerItem = NSMenuItem(title: "合盖防休眠", action: nil, keyEquivalent: "")
+        powerAwakeMenu = NSMenu(title: "合盖防休眠")
+        powerAwakeMenu.delegate = self
+        powerAwakeMenu.autoenablesItems = false
+        powerAwakeStatusItem = NSMenuItem(title: "正在读取状态…", action: nil, keyEquivalent: "")
+        powerAwakeStatusItem.isEnabled = false
+        powerAwakeMenu.addItem(powerAwakeStatusItem)
+        powerAwakeSleepItem = NSMenuItem(title: "当前休眠状态：未知", action: nil, keyEquivalent: "")
+        powerAwakeSleepItem.isEnabled = false
+        powerAwakeMenu.addItem(powerAwakeSleepItem)
+        let policy = NSMenuItem(title: "接电或电量 ≥50% 保持运行", action: nil, keyEquivalent: "")
+        policy.isEnabled = false
+        powerAwakeMenu.addItem(policy)
+        powerAwakeMenu.addItem(.separator())
+        powerAwakeEnableItem = NSMenuItem(title: "开启／更新…", action: #selector(enablePowerAwake), keyEquivalent: "")
+        powerAwakeEnableItem.target = self
+        powerAwakeMenu.addItem(powerAwakeEnableItem)
+        powerAwakeDisableItem = NSMenuItem(title: "关闭并还原设置…", action: #selector(disablePowerAwake), keyEquivalent: "")
+        powerAwakeDisableItem.target = self
+        powerAwakeMenu.addItem(powerAwakeDisableItem)
+        let refreshPower = NSMenuItem(title: "刷新状态", action: #selector(refreshPowerAwake), keyEquivalent: "")
+        refreshPower.target = self
+        powerAwakeMenu.addItem(refreshPower)
+        powerItem.submenu = powerAwakeMenu
+        menu.addItem(powerItem)
+        updatePowerAwakeMenu()
+
+        menu.addItem(.separator())
         diagnosticLoggingItem = NSMenuItem(title: "保存诊断日志", action: #selector(toggleDiagnosticLogging), keyEquivalent: "")
         diagnosticLoggingItem.target = self
         diagnosticLoggingItem.state = DiagnosticLog.isEnabled ? .on : .off
@@ -1682,7 +1718,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     func menuWillOpen(_ menu: NSMenu) {
         updateLaunchAtLoginItem()
+        powerAwake.refresh()
     }
+
+    private func updatePowerAwakeMenu() {
+        let status = powerAwake.status
+        powerAwakeStatusItem.title = powerAwake.isBusy ? "正在等待授权／执行操作…" :
+            (status.map { "服务：\($0.enabled ? "已开启" : "未开启")\($0.enabled && !$0.appBound ? "（独立服务，需转换）" : ($0.updatePending ? "（有更新待应用）" : ""))" }
+                ?? (powerAwake.errorMessage == nil ? "正在读取状态…" : "状态读取失败，可刷新重试"))
+        powerAwakeStatusItem.toolTip = powerAwake.errorMessage
+        let sleep = status?.sleepDisabled.map { $0 ? "已阻止休眠" : "允许休眠" } ?? "未知"
+        let source = status?.onAC.map { $0 ? "接电" : "电池供电" } ?? "电源未知"
+        let battery = status?.batteryPercent.map { "\($0)%" } ?? "电量未知"
+        powerAwakeSleepItem.title = "\(sleep) · \(source) · \(battery)"
+        powerAwakeEnableItem.isEnabled = powerAwake.canChange
+        powerAwakeDisableItem.isEnabled = powerAwake.canChange
+    }
+
+    @objc private func enablePowerAwake() { powerAwake.setEnabled(true) }
+    @objc private func disablePowerAwake() { powerAwake.setEnabled(false) }
+    @objc private func refreshPowerAwake() { powerAwake.refresh() }
 
     @objc private func runMenuCommand(_ sender: NSMenuItem) {
         guard let command = WindowCommand(rawValue: UInt32(sender.tag)) else { return }
@@ -1874,6 +1929,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         windowLayoutMemory?.stop()
         diagnosticLog("WindowKeys: normal termination")
         AccessibilityWindowController.shared.cancelWindowAnimation()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard powerAwake.canQuit else {
+            NSSound.beep()
+            return .terminateCancel
+        }
+        return .terminateNow
     }
 
     @objc private func quit() {

@@ -1,0 +1,276 @@
+#!/bin/bash
+set -euo pipefail
+
+LABEL=local.power-awake
+HELPER=/Library/PrivilegedHelperTools/local.power-awake
+PLIST=/Library/LaunchDaemons/local.power-awake.plist
+STATE=/var/db/local.power-awake
+PMSET=/usr/bin/pmset
+LAUNCHCTL=/bin/launchctl
+OWNER_PID=
+OWNER_START=
+
+usage() {
+    cat <<'HELP'
+Usage: power-awake on | off | status | help
+  on      Install/start/update closed-lid wake protection (requires sudo).
+  off     Stop/remove the service and restore saved power settings (requires sudo).
+  status  Show the service, power source and current sleep policy.
+
+On AC: disable system sleep, including lid sleep. Display sleep is unchanged.
+On battery at 50% or more: keep system sleep disabled.
+On battery below 50%: allow system sleep again within about 2 seconds.
+This does not start a proxy, wake an already sleeping Mac, or guarantee networking.
+Do not put a running closed-lid laptop in a bag; keep it ventilated.
+WindowKeys uses app-on PID START to bind protection to its process lifetime.
+HELP
+}
+
+owner_start() { /bin/ps -p "$1" -o lstart= 2>/dev/null | /usr/bin/sed 's/^ *//;s/ *$//'; }
+
+owner_alive() {
+    [[ -n "$OWNER_PID" && -n "$OWNER_START" ]] &&
+        [[ "$(owner_start "$OWNER_PID")" == "$OWNER_START" ]]
+}
+
+validate_owner() {
+    valid_number "$OWNER_PID" && [[ "$OWNER_PID" != 0 ]] && owner_alive || return 1
+    local command
+    command=$(/bin/ps -p "$OWNER_PID" -o comm=)
+    [[ "${command##*/}" == WindowKeys ]]
+}
+
+power_snapshot() {
+    local output source percent
+    output=$("$PMSET" -g batt) || { printf 'unknown unknown\n'; return; }
+    case "$output" in
+        *"Now drawing from 'AC Power'"*) source=ac ;;
+        *"Now drawing from 'Battery Power'"*) source=battery ;;
+        *) source=unknown ;;
+    esac
+    percent=$(printf '%s\n' "$output" | /usr/bin/awk '
+        /-InternalBattery/ {
+            if (match($0, /[0-9]+%/)) {
+                value=substr($0, RSTART, RLENGTH-1)+0
+                if (value >= 0 && value <= 100) { print value+0; exit }
+            }
+        }')
+    printf '%s %s\n' "$source" "${percent:-unknown}"
+}
+
+sleep_disabled() {
+    "$PMSET" -g | /usr/bin/awk '$1 == "SleepDisabled" { print $2; found=1; exit } END { if (!found) exit 1 }'
+}
+
+ac_sleep() {
+    "$PMSET" -g custom | /usr/bin/awk '
+        /^AC Power:/ { ac=1; next }
+        /^[^[:space:]]/ { ac=0 }
+        ac && $1 == "sleep" { print $2; found=1; exit }
+        END { if (!found) exit 1 }'
+}
+
+valid_number() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+save_state() {
+    local disabled idle
+    disabled=$(sleep_disabled)
+    idle=$(ac_sleep)
+    [[ "$disabled" == 0 || "$disabled" == 1 ]] && valid_number "$idle" || {
+        echo 'Cannot read original pmset settings; nothing changed.' >&2; return 1;
+    }
+    /bin/mkdir -p "$STATE"
+    /bin/chmod 700 "$STATE"
+    printf '%s\n' "$disabled" > "$STATE/disablesleep"
+    printf '%s\n' "$idle" > "$STATE/ac-sleep"
+}
+
+restore_state() {
+    local disabled idle
+    [[ -f "$STATE/disablesleep" && -f "$STATE/ac-sleep" ]] || {
+        echo 'Saved settings are missing; refusing to guess original values.' >&2; return 1;
+    }
+    disabled=$(/bin/cat "$STATE/disablesleep")
+    idle=$(/bin/cat "$STATE/ac-sleep")
+    [[ "$disabled" == 0 || "$disabled" == 1 ]] && valid_number "$idle" || {
+        echo 'Invalid saved settings; refusing to restore.' >&2; return 1;
+    }
+    "$PMSET" -a disablesleep "$disabled"
+    "$PMSET" -c sleep "$idle"
+}
+
+reconcile() {
+    local source percent desired current
+    read -r source percent <<< "$(power_snapshot)"
+    # A single snapshot avoids mixing power source and charge from different checks.
+    desired=0
+    if [[ "$source" == ac ]]; then
+        desired=1
+    elif [[ "$source" == battery ]] && valid_number "$percent" && (( percent >= 50 )); then
+        desired=1
+    fi
+    current=$(sleep_disabled) || return 1
+    if [[ "$current" != "$desired" ]]; then
+        "$PMSET" -a disablesleep "$desired"
+        printf '%s source=%s battery=%s disablesleep=%s\n' "$(/bin/date '+%Y-%m-%d %H:%M:%S')" "$source" "$percent" "$desired"
+    fi
+}
+
+service_loaded() { "$LAUNCHCTL" print "system/$LABEL" >/dev/null 2>&1; }
+
+write_plist() {
+    local arguments keepalive
+    arguments="<string>$HELPER</string><string>--daemon</string>"
+    keepalive='<key>KeepAlive</key><true/>'
+    if [[ -n "$OWNER_PID" ]]; then
+        # Only digits and ps's fixed-format timestamp are permitted in the plist.
+        [[ "$OWNER_START" =~ ^[A-Za-z0-9[:space:]:]+$ ]] || return 1
+        arguments="<string>$HELPER</string><string>--app-daemon</string><string>$OWNER_PID</string><string>$OWNER_START</string>"
+        keepalive='<key>KeepAlive</key><false/>'
+    fi
+    cat > "$PLIST" <<PLIST_XML
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array>$arguments</array>
+  <key>RunAtLoad</key><true/>
+  $keepalive
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Background</string>
+</dict></plist>
+PLIST_XML
+    /usr/sbin/chown root:wheel "$PLIST"
+    /bin/chmod 644 "$PLIST"
+    /usr/bin/plutil -lint "$PLIST" >/dev/null
+}
+
+stop_loaded_service() {
+    if service_loaded; then
+        local old_pid
+        old_pid=$("$LAUNCHCTL" print "system/$LABEL" | /usr/bin/awk '$1 == "pid" && $2 == "=" { print $3; exit }')
+        # Stop the old process before replacing its script; preserve the snapshot.
+        "$LAUNCHCTL" bootout "system/$LABEL"
+        # An app-bound daemon restores its snapshot on TERM. Finish that cleanup
+        # before installing another worker or taking a new snapshot.
+        if valid_number "$old_pid"; then
+            local tries=0
+            while /bin/kill -0 "$old_pid" 2>/dev/null; do
+                (( tries += 1 ))
+                (( tries < 50 )) || { echo 'Old daemon did not stop; refusing to replace it.' >&2; return 1; }
+                /bin/sleep 0.1
+            done
+        fi
+    fi
+}
+
+enable_service() {
+    stop_loaded_service
+    # Never overwrite the original settings on repeated enable or interrupted install.
+    if [[ ! -d "$STATE" ]]; then save_state; fi
+    /bin/mkdir -p /Library/PrivilegedHelperTools
+    /usr/bin/install -o root -g wheel -m 755 "${BASH_SOURCE[0]}" "$HELPER"
+    if ! (set -e; write_plist; "$PMSET" -c sleep 0; reconcile;
+          "$LAUNCHCTL" enable "system/$LABEL";
+          "$LAUNCHCTL" bootstrap system "$PLIST";
+          service_loaded); then
+        echo 'Enable failed; restoring original settings. Backup retained for recovery.' >&2
+        if service_loaded; then "$LAUNCHCTL" bootout "system/$LABEL" || return 1; fi
+        restore_state
+        return 1
+    fi
+    if [[ -n "$OWNER_PID" ]]; then
+        echo 'Enabled: protection ends and original settings restore when WindowKeys exits.'
+    else
+        echo 'Enabled: AC or battery >=50% keeps the Mac awake; battery <50% allows sleep. Survives reboot.'
+    fi
+}
+
+app_daemon_cleanup() {
+    trap - EXIT TERM INT HUP
+    if restore_state; then
+        /bin/rm -f "$PLIST" "$HELPER" "$STATE/disablesleep" "$STATE/ac-sleep"
+        /bin/rmdir "$STATE"
+        echo 'WindowKeys exited: protection removed and original settings restored.'
+        # Unload last: bootout may terminate this process immediately.
+        "$LAUNCHCTL" bootout "system/$LABEL" || true
+    else
+        echo 'Could not restore settings; recovery files retained.' >&2
+    fi
+}
+
+disable_service() {
+    stop_loaded_service
+    if [[ -d "$STATE" ]]; then
+        restore_state
+        /bin/rm -f "$STATE/disablesleep" "$STATE/ac-sleep"
+        /bin/rmdir "$STATE"
+    elif [[ -f "$PLIST" ]]; then
+        echo 'Service stopped, but saved settings are missing. Check pmset -g manually.' >&2
+        return 1
+    fi
+    /bin/rm -f "$PLIST" "$HELPER"
+    echo 'Disabled: service removed and saved settings restored.'
+}
+
+status() {
+    local source percent
+    read -r source percent <<< "$(power_snapshot)"
+    if service_loaded; then echo 'Service: enabled'; else echo 'Service: disabled'; fi
+    if [[ -f "$PLIST" ]] && [[ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$PLIST" 2>/dev/null)" == --app-daemon ]]; then
+        echo 'Lifecycle: app-bound'
+    else
+        echo 'Lifecycle: standalone'
+    fi
+    printf 'Power source: %s\n' "$source"
+    printf 'Battery charge: %s%%\n' "$percent"
+    echo 'Policy: awake on AC or battery >=50%; allow sleep on battery <50%.'
+    if service_loaded && ! /usr/bin/cmp -s "${BASH_SOURCE[0]}" "$HELPER"; then
+        echo 'Update pending: run power-awake on to apply the installed command to the service.'
+    fi
+    printf 'System sleep disabled: %s (1=blocked, 0=allowed)\n' "$(sleep_disabled)"
+    printf 'AC idle sleep: %s minute(s) (0=never)\n' "$(ac_sleep)"
+    if [[ -d "$STATE" ]]; then echo "Original settings backup: $STATE (root only)"; fi
+}
+
+main() {
+    [[ "$(/usr/bin/uname -s)" == Darwin ]] || { echo 'macOS only.' >&2; return 1; }
+    case "${1:-status}" in
+        on|off|app-on)
+            if [[ "$1" == app-on ]]; then
+                [[ $# == 3 ]] || return 2
+                OWNER_PID=$2; OWNER_START=$3
+                validate_owner || { echo 'WindowKeys owner process is invalid.' >&2; return 1; }
+            else
+                [[ $# == 1 ]] || { usage; return 2; }
+            fi
+            if [[ "$EUID" != 0 ]]; then
+                exec /usr/bin/sudo /bin/bash "${BASH_SOURCE[0]}" "$@"
+            fi
+            if [[ "$1" == off ]]; then disable_service; else enable_service; fi
+            ;;
+        status) status ;;
+        help|-h|--help) usage ;;
+        --daemon)
+            [[ "$EUID" == 0 && -d "$STATE" ]] || return 1
+            while true; do
+                if ! reconcile; then echo 'Power policy check failed; retrying.' >&2; fi
+                /bin/sleep 2
+            done
+            ;;
+        --app-daemon)
+            [[ $# == 3 && "$EUID" == 0 && -d "$STATE" ]] || return 1
+            OWNER_PID=$2; OWNER_START=$3
+            valid_number "$OWNER_PID" || return 1
+            trap app_daemon_cleanup EXIT
+            trap 'exit 0' TERM INT HUP
+            while owner_alive; do
+                if ! reconcile; then echo 'Power policy check failed; retrying.' >&2; fi
+                /bin/sleep 2
+            done
+            ;;
+        *) usage >&2; return 2 ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

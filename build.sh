@@ -8,6 +8,8 @@ contents_dir="$app_dir/Contents"
 macos_dir="$contents_dir/MacOS"
 
 mkdir -p "$macos_dir"
+mkdir -p "$contents_dir/Resources"
+cp "$project_dir/Resources/power-awake" "$contents_dir/Resources/power-awake"
 cp "$project_dir/Info.plist" "$contents_dir/Info.plist"
 
 xcrun clang -target arm64-apple-macosx13.0 -O2 -fmodules -DMAX_DISPLAYS=16 \
@@ -32,6 +34,7 @@ xcrun swiftc \
   "$project_dir/Sources/WindowKeys/WindowLayoutMemory.swift" \
   "$project_dir/Sources/WindowKeys/WindowGeometryAnimation.swift" \
   "$project_dir/Sources/WindowKeys/DisplayControl.swift" \
+  "$project_dir/Sources/WindowKeys/PowerAwakeController.swift" \
   -o "$macos_dir/WindowKeys"
 
 codesign --force --sign - --identifier com.bland.windowkeys "$app_dir"

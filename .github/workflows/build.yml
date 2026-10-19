@@ -24,6 +24,9 @@ jobs:
       - name: Test remembered window layouts
         run: zsh Tests/run-window-layout-memory.sh
 
+      - name: Test power-awake policy and status
+        run: zsh Tests/run-power-awake.sh
+
       - name: Verify app bundle
         run: |
           test -x build/WindowKeys.app/Contents/MacOS/WindowKeys
