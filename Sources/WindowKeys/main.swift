@@ -1561,6 +1561,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var resizeSettingsWindowController: ResizeSettingsWindowController?
     private var inputMethodSettingsWindowController: InputMethodSettingsWindowController?
     private var displayControlWindowController: DisplayControlWindowController?
+    private let brightnessKeys = DisplayBrightnessKeys()
+    private var brightnessKeysItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         diagnosticLog("WindowKeys: launching; macOS %@; input switching enabled=%d",
@@ -1584,6 +1586,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         _ = AccessibilityWindowController.shared.requestAccessibilityIfNeeded()
         updateWindowLayoutMemory()
+        brightnessKeys.onChange = { [weak self] in self?.displayControlWindowController?.brightnessDidChange() }
+        brightnessKeys.onError = { message in diagnosticLog("WindowKeys: brightness keys: %@", message) }
+        brightnessKeys.start()
+        updateBrightnessKeysItem()
         if !hotKeyManager.registrationFailures.isEmpty {
             let alert = NSAlert()
             alert.messageText = "部分窗口快捷键注册失败"
@@ -1661,6 +1667,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         let displayItem = NSMenuItem(title: "外接显示器…", action: #selector(showDisplayControl), keyEquivalent: "")
         displayItem.target = self
         menu.addItem(displayItem)
+        brightnessKeysItem = NSMenuItem(title: "系统亮度键同步外接屏", action: #selector(toggleBrightnessKeys), keyEquivalent: "")
+        brightnessKeysItem.target = self
+        menu.addItem(brightnessKeysItem)
 
         menu.addItem(.separator())
         let powerItem = NSMenuItem(title: "合盖防休眠", action: nil, keyEquivalent: "")
@@ -1719,6 +1728,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     func menuWillOpen(_ menu: NSMenu) {
         updateLaunchAtLoginItem()
         powerAwake.refresh()
+        brightnessKeys.start()
+        updateBrightnessKeysItem()
+    }
+
+    private func updateBrightnessKeysItem() {
+        brightnessKeysItem.state = brightnessKeys.isActive ? .on : .off
+        brightnessKeysItem.title = brightnessKeys.isEnabled && !brightnessKeys.isActive
+            ? "系统亮度键同步外接屏（点击授权）" : "系统亮度键同步外接屏"
+        brightnessKeysItem.toolTip = "同步调整所有支持 DDC/CI 的外接屏，保留系统亮度键行为；Option-Shift 支持微调。"
+    }
+
+    @objc private func toggleBrightnessKeys() {
+        if brightnessKeys.isActive {
+            brightnessKeys.isEnabled = false
+            brightnessKeys.stop()
+        } else {
+            brightnessKeys.isEnabled = true
+            if !CGPreflightListenEventAccess() { _ = CGRequestListenEventAccess() }
+            brightnessKeys.start()
+            if !brightnessKeys.isActive {
+                let alert = NSAlert()
+                alert.messageText = "无法监听系统亮度键"
+                alert.informativeText = "请在系统设置 → 隐私与安全性 → 输入监控中允许 WindowKeys，然后重新启动应用。现有的显示器滑块仍可使用。"
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
+        }
+        updateBrightnessKeysItem()
     }
 
     private func updatePowerAwakeMenu() {
@@ -1926,6 +1963,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        brightnessKeys.stop()
         windowLayoutMemory?.stop()
         diagnosticLog("WindowKeys: normal termination")
         AccessibilityWindowController.shared.cancelWindowAnimation()

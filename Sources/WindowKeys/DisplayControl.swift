@@ -1,5 +1,7 @@
 import AppKit
 
+private let displayControlQueue = DispatchQueue(label: "com.bland.windowkeys.display-control")
+
 private struct ExternalDisplay: Decodable {
     let id: String
     let name: String
@@ -52,6 +54,103 @@ private func runDisplayControl(_ arguments: [String]) throws -> Data {
     return output.fileHandleForReading.readDataToEndOfFile()
 }
 
+final class DisplayBrightnessKeys {
+    var onChange: (() -> Void)?
+    var onError: ((String) -> Void)?
+    private var tap: CFMachPort?
+    private var source: CFRunLoopSource?
+    private var pendingSteps = 0.0
+    private var working = false
+    var isActive: Bool { tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
+    var isEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "ExternalBrightnessKeys") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "ExternalBrightnessKeys") }
+    }
+
+    // NX_SYSDEFINED brightness keys, not ordinary F1/F2 keyDown events.
+    static func step(for event: NSEvent) -> Double? {
+        guard event.type == .systemDefined, event.subtype.rawValue == 8,
+              (event.data1 >> 8) & 0xff == 0x0a else { return nil }
+        let key = (event.data1 >> 16) & 0xffff
+        guard key == 2 || key == 3 else { return nil }
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        guard modifiers.isEmpty || modifiers == [.option, .shift] else { return nil }
+        return (key == 2 ? 1.0 : -1.0) * (modifiers.isEmpty ? 1 : 0.25)
+    }
+
+    static func target(current: Int, maximum: Int, steps: Double) -> Int {
+        min(maximum, max(0, current + Int((Double(maximum) * steps / 16).rounded(.awayFromZero))))
+    }
+
+    func start() {
+        guard isEnabled else { return }
+        if let tap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            return
+        }
+        guard let tap = CGEvent.tapCreate(tap: .cghidEventTap, place: .headInsertEventTap,
+            options: .listenOnly, eventsOfInterest: CGEventMask(1 << 14), callback: { _, type, event, context in
+                guard let context else { return Unmanaged.passUnretained(event) }
+                let owner = Unmanaged<DisplayBrightnessKeys>.fromOpaque(context).takeUnretainedValue()
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let tap = owner.tap { CGEvent.tapEnable(tap: tap, enable: true) }
+                } else if let keyEvent = NSEvent(cgEvent: event), let step = DisplayBrightnessKeys.step(for: keyEvent) {
+                    owner.pendingSteps = min(16, max(-16, owner.pendingSteps + step))
+                    if !owner.working {
+                        owner.working = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak owner] in owner?.drain() }
+                    }
+                }
+                // Listen only: macOS still receives every event for the built-in display.
+                return Unmanaged.passUnretained(event)
+            }, userInfo: Unmanaged.passUnretained(self).toOpaque()) else { return }
+        self.tap = tap
+        source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    func stop() {
+        pendingSteps = 0
+        if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+        if let tap { CFMachPortInvalidate(tap) }
+        source = nil
+        tap = nil
+    }
+
+    private func drain() {
+        guard isEnabled, pendingSteps != 0 else { working = false; return }
+        let steps = pendingSteps
+        pendingSteps = 0
+        displayControlQueue.async {
+            let result = Result { try JSONDecoder().decode([ExternalDisplay].self, from: runDisplayControl(["list"])) }
+            var errors: [String] = []
+            switch result {
+            case .success(let displays):
+                for display in displays {
+                    let adjustment = Result {
+                        let values = try JSONDecoder().decode(DisplayValues.self, from: runDisplayControl(["read", display.id]))
+                        guard let brightness = values.brightness else { return }
+                        let target = Self.target(current: brightness.current, maximum: brightness.maximum, steps: steps)
+                        if target != brightness.current {
+                            _ = try runDisplayControl(["set", display.id, "brightness", String(target)])
+                        }
+                    }
+                    if case .failure(let error) = adjustment { errors.append("\(display.name): \(error.localizedDescription)") }
+                }
+            case .failure(let error): errors.append(error.localizedDescription)
+            }
+            DispatchQueue.main.async {
+                if !errors.isEmpty { self.onError?(errors.joined(separator: "\n")) }
+                self.onChange?()
+                self.drain()
+            }
+        }
+    }
+
+    deinit { stop() }
+}
+
 final class DisplayControlWindowController: NSWindowController {
     private let displays = NSPopUpButton(frame: .zero, pullsDown: false)
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
@@ -60,7 +159,7 @@ final class DisplayControlWindowController: NSWindowController {
     private let brightnessLabel = NSTextField(labelWithString: "亮度：未读取")
     private let volumeLabel = NSTextField(labelWithString: "音量：未读取")
     private let status = NSTextField(wrappingLabelWithString: "")
-    private let queue = DispatchQueue(label: "com.bland.windowkeys.display-control")
+    private let queue = displayControlQueue
     private var availableDisplays: [ExternalDisplay] = []
     private var values: DisplayValues?
     private var busy = false
@@ -116,6 +215,10 @@ final class DisplayControlWindowController: NSWindowController {
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         refresh()
+    }
+
+    func brightnessDidChange() {
+        if window?.isVisible == true { refresh() }
     }
 
     private var selectedID: String? {
